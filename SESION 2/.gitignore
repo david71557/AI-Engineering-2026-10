@@ -1,0 +1,11 @@
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Entornos virtuales
+.venv/
+
+# Archivos Python generados
+__pycache__/
+*.py[cod]
