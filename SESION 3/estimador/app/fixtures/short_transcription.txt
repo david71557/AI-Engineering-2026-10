@@ -1,8 +1,0 @@
-A B2B SaaS company needs an admin portal to manage their existing customer
-accounts. Required features: user authentication with SSO support (Google and
-Microsoft), a customer list with search and filtering, a detail view for each
-customer with their current plan and usage metrics, the ability to upgrade or
-downgrade a plan, an audit log of all admin actions, and basic role-based access
-control with two roles (admin and read-only). Backend will reuse the existing
-PostgreSQL database via a thin REST API. Frontend in React. Target launch in
-six weeks.
