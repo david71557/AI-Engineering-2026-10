@@ -194,8 +194,13 @@ def _invoke_llm_stream(
     user_message: str,
     model_override: str | None,
     max_tokens: int,
+    usage: dict[str, Any] | None = None,
 ) -> Iterator[str]:
-    """Streaming counterpart of ``_invoke_llm``: yields text deltas as they arrive."""
+    """Streaming counterpart of ``_invoke_llm``: yields text deltas as they arrive.
+
+    If ``usage`` is given, it is filled with ``model``, ``input_tokens`` and
+    ``output_tokens`` once the stream ends.
+    """
     settings = get_settings()
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
     model = model_override or settings.LLM_MODEL
@@ -208,13 +213,19 @@ def _invoke_llm_stream(
         ],
         max_tokens=max_tokens,
         stream=True,
+        # Ask OpenAI to append a final chunk (with empty ``choices``) carrying token usage.
+        stream_options={"include_usage": True},
     )
 
     for chunk in stream:
-        # The first chunk only carries the role and the last one only the
-        # finish_reason; skip anything without text.
+        # The first chunk only carries the role and the last ones only the
+        # finish_reason / usage; skip anything without text.
         if chunk.choices and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+        if chunk.usage is not None and usage is not None:
+            usage["model"] = chunk.model
+            usage["input_tokens"] = chunk.usage.prompt_tokens
+            usage["output_tokens"] = chunk.usage.completion_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -313,11 +324,13 @@ def generate_estimation(
 def stream_estimation(
     transcription: str,
     opts: GenerationOptions | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> Iterator[str]:
     """Stream a software estimation token by token, using the same system prompt.
 
-    Two-phase preprocessing is not supported here: phase 1 would run silently
-    before the first token, defeating the point of streaming.
+    Pass a dict as ``usage`` to receive the model and token counts when the
+    stream finishes. Two-phase preprocessing is not supported here: phase 1
+    would run silently before the first token, defeating the point of streaming.
     """
     opts = opts or GenerationOptions()
 
@@ -343,6 +356,7 @@ def stream_estimation(
             user_message=transcription,
             model_override=opts.model,
             max_tokens=opts.max_tokens,
+            usage=usage,
         )
     except Exception as exc:
         log.error("llm_stream_failed", error=str(exc), error_type=type(exc).__name__)
