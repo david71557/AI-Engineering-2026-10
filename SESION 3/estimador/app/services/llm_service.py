@@ -1,10 +1,11 @@
 """Estimation orchestration: prompt building, optional preprocessing, and dispatch
-to the LLM (OpenAI) through the single ``_invoke_llm`` seam.
+to the LLM (OpenAI) through the ``_invoke_llm`` / ``_invoke_llm_stream`` seams.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -187,6 +188,35 @@ def _invoke_llm(
     }
 
 
+def _invoke_llm_stream(
+    *,
+    system_prompt: str,
+    user_message: str,
+    model_override: str | None,
+    max_tokens: int,
+) -> Iterator[str]:
+    """Streaming counterpart of ``_invoke_llm``: yields text deltas as they arrive."""
+    settings = get_settings()
+    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    model = model_override or settings.LLM_MODEL
+
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=max_tokens,
+        stream=True,
+    )
+
+    for chunk in stream:
+        # The first chunk only carries the role and the last one only the
+        # finish_reason; skip anything without text.
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
 # ---------------------------------------------------------------------------
 # Two-phase preprocessing (phase 1: requirement extraction)
 # ---------------------------------------------------------------------------
@@ -278,3 +308,42 @@ def generate_estimation(
     result["latency_ms"] = int((time.perf_counter() - t0) * 1000)
 
     return result
+
+
+def stream_estimation(
+    transcription: str,
+    opts: GenerationOptions | None = None,
+) -> Iterator[str]:
+    """Stream a software estimation token by token, using the same system prompt.
+
+    Two-phase preprocessing is not supported here: phase 1 would run silently
+    before the first token, defeating the point of streaming.
+    """
+    opts = opts or GenerationOptions()
+
+    system_prompt = build_system_prompt(
+        example_format=opts.example_format,
+        num_examples=opts.num_examples,
+        use_examples=opts.use_examples,
+        inline_cleaning=(opts.preprocessing == "inline_cleaning"),
+    )
+
+    log.info(
+        "streaming_estimation",
+        model_override=opts.model,
+        example_format=opts.example_format,
+        num_examples=opts.num_examples,
+        use_examples=opts.use_examples,
+        max_tokens=opts.max_tokens,
+    )
+
+    try:
+        yield from _invoke_llm_stream(
+            system_prompt=system_prompt,
+            user_message=transcription,
+            model_override=opts.model,
+            max_tokens=opts.max_tokens,
+        )
+    except Exception as exc:
+        log.error("llm_stream_failed", error=str(exc), error_type=type(exc).__name__)
+        raise LLMServiceError(f"LLM call failed: {exc}") from exc

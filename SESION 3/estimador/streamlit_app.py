@@ -1,9 +1,10 @@
 """Streamlit chat UI for the estimator.
 
-Streamlit calls the service layer directly: ``generate_estimation`` builds the
+Streamlit calls the service layer directly: ``stream_estimation`` builds the
 same CAG system prompt used by ``POST /api/v1/estimate`` (``build_system_prompt``)
-and sends the transcription to the LLM through ``_invoke_llm``. The API key is
-never in this file — it is read from ``.env`` by ``app.config.get_settings``.
+and streams the LLM answer token by token, rendered live with ``st.write_stream``.
+The API key is never in this file — it is read from ``.env`` by
+``app.config.get_settings``.
 
 Run from the ``estimador`` folder so ``.env`` and the ``app`` package resolve:
 
@@ -12,11 +13,13 @@ Run from the ``estimador`` folder so ``.env`` and the ``app`` package resolve:
 
 from __future__ import annotations
 
+import time
+
 import streamlit as st
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.services.llm_service import LLMServiceError, generate_estimation
+from app.services.llm_service import LLMServiceError, stream_estimation
 
 st.set_page_config(page_title="Software Estimator", page_icon="📊")
 st.title("Software Estimator")
@@ -44,19 +47,14 @@ if prompt := st.chat_input("Paste your meeting transcription here..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Generating estimation..."):
-            try:
-                result = generate_estimation(prompt)
-                response = result["estimation"]
-                st.markdown(response)
-                usage = result["usage"]
-                st.caption(
-                    f"{result['model']} · {usage['input_tokens']} in / "
-                    f"{usage['output_tokens']} out tokens · {result['latency_ms']} ms"
-                )
-            except LLMServiceError as exc:
-                response = f"Could not generate the estimation: {exc}"
-                st.error(response)
+        try:
+            t0 = time.perf_counter()
+            # write_stream renders each chunk as it arrives and returns the full text.
+            response = st.write_stream(stream_estimation(prompt))
+            st.caption(f"{settings.LLM_MODEL} · {int((time.perf_counter() - t0) * 1000)} ms")
+        except LLMServiceError as exc:
+            response = f"Could not generate the estimation: {exc}"
+            st.error(response)
 
     st.session_state.messages.append({"role": "assistant", "content": response})
 
