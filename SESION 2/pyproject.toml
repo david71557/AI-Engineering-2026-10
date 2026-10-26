@@ -9,4 +9,5 @@ dependencies = [
     "pydantic-settings>=2.16.0",
     "python-dotenv>=1.2.4",
     "uvicorn[standard]>=0.54.0",
+    "structlog>=24.0",
 ]
