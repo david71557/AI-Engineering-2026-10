@@ -1,0 +1,311 @@
+[Discovery call — Acme Foods × our agency. Two parts in the same recording: a kickoff with the client (Marta, Head of Operations; David, IT Manager) and a deep-dive technical session with their senior backend engineer (Pablo) added in. From our side: Lucia (account lead) and Tom (tech lead). Auto-transcribed, so the punctuation is approximate; speaker labels were added by the transcription tool by voice fingerprint and may be slightly off in places.]
+
+=== PART 1 — Discovery / Kickoff ===
+
+Marta: ...so yeah, sorry I was a bit late, the kids' school thing went on forever. Anyway. Tom, Lucia, thanks for jumping on. How was the weekend?
+
+Tom: All good, all good. Lucia was telling me about the Barcelona restaurant, by the way. I didn't realize you guys had grown that much.
+
+Marta: Yeah, fifteen now. Fifteen restaurants. David, you're muted.
+
+David: Sorry. Yes, fifteen. Sixteen if you count the cloud kitchen in Hospitalet but that's a different beast.
+
+Marta: Right, the cloud kitchen is delivery only, it doesn't take reservations. So fifteen for what we're talking about today. OK so, look, the bottom line is our reservation system is a mess. Every single one of those fifteen restaurants does reservations differently. Some still use a paper book, can you believe that, we're in 2025 and they still have a paper book. Some use TheFork, the Madrid one signed up to OpenTable a year ago without telling us, the flagship in Barcelona built their own thing in like 2017 with some freelancer who doesn't return calls. We need one platform. Something we own.
+
+Lucia: OK. And when you say "we own", you mean a custom build, not just rolling everyone onto TheFork or Resy or whatever?
+
+Marta: Custom. We've been burned by white-label stuff. Twice. The first time was a CRM in 2019, the second was the loyalty thing that we ended up rebuilding internally anyway. So now there's a healthy paranoia about handing core operational software to a third party. Also we have this loyalty thing — David, explain it.
+
+David: Right, so we run a loyalty program across all the restaurants. The points stack across restaurants, which is the whole point — eat at the Madrid bistro, redeem at the Valencia one. None of the off-the-shelf reservation systems integrate with it. Every time we evaluated one, the loyalty piece either didn't fit or was an extra eighteen months of waterfall integration work on the vendor's roadmap. So we'd rather build the reservation thing in-house and plug our existing loyalty backend into it.
+
+Tom: Got it. Quick question on the loyalty backend — what does that look like today? Is it an API, a database we'd hit directly, what's the contract?
+
+David: It's a Java service, Spring Boot, Java 17, exposed over REST. Documented with OpenAPI, mostly. There's a little bit of, you know, "tribal knowledge" in some endpoints, but the guy who built it is still with us so we can pull him in. His name's Pablo, you'll meet him later, he's joining the second half of this call. The auth is OAuth2 client credentials, internal only. No public exposure today.
+
+Tom: Perfect. Latency-wise, is it fast?
+
+David: Fast for our use case. P95 around eighty milliseconds for a balance lookup, half a second for redemption — the redemption has to write to the ledger, that's why. We've never had to scale it really hard, peak is maybe two hundred RPS during weekend dinners.
+
+Tom: OK, that should be fine. Marta, sorry, you were saying.
+
+Marta: Now, also — and this is where I keep going back and forth — we want something simple. I keep telling David, simple, simple, simple. People should be able to book a table in three clicks. But, you know, also we want some intelligence in there. Like, dynamic suggestions. If someone always books the same table on Tuesday at eight, suggest it. If a regular hasn't been around in three months, flag it to the manager so they can call and check in. Or like, on a slow Wednesday in February when the chef has too much sea bass in the walk-in, suggest pushing a sea bass tasting menu to the regulars who like fish. We were chatting about AI, dashboards, all of that.
+
+Lucia: OK so when you say "AI" — are you thinking recommendation engine, generative...
+
+Marta: Honestly I don't know what I'm thinking. Whatever the smart version is. Something that surprises me. But not, not a chatbot. I do not want a chatbot. The kids told me chatbots are over. Apparently agents are the new thing or something, I don't know. No chatbots though, I was very clear with David on that.
+
+David: She was clear, yes.
+
+Tom: Noted, no chatbot. Let's tag that as "intelligent suggestions, exact scope to be defined". We'll come back to it. I want to be honest, those kinds of recommenders are non-trivial, especially the cold-start case for new diners and the whole "promote unsold menu items" angle, that's a different model entirely. So we'll likely scope a v1 with simpler heuristics — last-table preference, dormant-customer flag — and leave the menu-balancing thing for a phase two. OK?
+
+Marta: That's fair. Phase one, simple smart stuff. Phase two, the chef's dream of selling all the sea bass.
+
+David: Also — and I know we're jumping around — the SAP piece. Marta you said earlier...
+
+Marta: Right. So we close the books in SAP. Every reservation that turns into a covered table eventually becomes a line on the P&L, obviously, well, not the reservation itself, but the resulting bill. The bill goes through our POS system, BCN-Touch, and from there it gets pushed to SAP. Today the link between the reservation system and the POS is non-existent — the manager opens a paper note, types it into the POS, the POS knows nothing about whether it was a reservation or a walk-in, and then SAP gets numbers. We want the new reservation platform to know which covers were reservations and to push that information... somewhere... so we can do conversion analysis. David has the spec.
+
+David: Yes, there's an SAP IDoc spec we use today for the POS integration. I'll share it. I want to be clear though — we don't necessarily need direct SAP integration from the reservation platform. What we need is for the reservation platform to enrich the BCN-Touch POS records with a reservation_id and customer_id when a reservation is seated. The POS already pushes to SAP. So really it's POS integration we need, not SAP integration, in phase one.
+
+Tom: OK that's a much smaller piece, good. Noted: integration with BCN-Touch POS, not direct SAP. Is BCN-Touch a SaaS or self-hosted?
+
+David: Self-hosted, but they expose a REST API on the local network of each restaurant. We have a VPN tunnel from HQ to each of them already. The API is, uh, it's there. It works. It's not exactly modern, you'll see when you read the docs.
+
+Lucia: And on the user side, who uses the platform? Walk me through the personas.
+
+Marta: Three groups. Customers — they book through the website or, sorry, that's the other thing, obviously it has to work on mobile, like, that's not even a feature, that's just table stakes. Customers also include people who walk in without a reservation and the host adds them to the floor; they need to exist in the system retroactively, so the loyalty points still accrue. Then the restaurant managers — they manage the floor, the no-shows, they reassign tables when a four-top becomes a six-top because someone's mother-in-law showed up unannounced, all that. They're also the ones who handle complaints and adjust loyalty points by hand. And then HQ — me, basically — for analytics and reporting across all locations, and also the regional managers who oversee three or four restaurants each.
+
+Tom: Native apps or web for customers?
+
+Marta: I... probably web? David?
+
+David: Web first. We had a bad experience with mobile apps two years ago, the maintenance was murder, every iOS update broke something. Mobile-friendly web, PWA if it makes sense. Maybe native later if we see demand. The managers, on the other hand, they really do need a tablet experience because they're walking the floor with an iPad, so for them the responsive web has to be genuinely usable on a 10-inch screen, not an afterthought.
+
+Tom: Got it. Now, the analytics — what does HQ need to see day to day?
+
+Marta: Bookings per restaurant, no-show rate by day of week, conversion of website visits to bookings, average party size, peak hours, repeat customer rate, average time between visits, cancellation reasons. And — this is important — I want to be able to slice it by region and by manager. Each regional manager has a view, the restaurant manager has a smaller view, the chef has yet another smaller view focused on covers and turn rate. So role-based dashboards.
+
+Lucia: That's going to mean an analytics layer with aggregations, not just listing data.
+
+Marta: Right.
+
+Tom: Real-time? Can it be near-real-time, like a few minutes lag?
+
+Marta: Near-real-time is fine. The restaurant manager wants to see "how many covers do I have tonight" in real time — that's just a query. The reporting dashboards can be refreshed every five minutes, every ten minutes, I don't care.
+
+Tom: OK. We're starting to talk about a couple of different surfaces — operational live data versus aggregated analytics. We'll separate them in the architecture.
+
+Marta: One more — and this is important — we're starting the franchise expansion in Portugal in the autumn. So the system has to handle multi-country from day one.
+
+Lucia: Multi-country meaning multi-language, multi-currency, time zones, tax rules, what's the scope?
+
+Marta: Multi-language for sure. Spanish, Catalan, Portuguese to start, English on top because the tourist business in Barcelona is still a thing, French would be nice eventually. Multi-currency, eh, EUR everywhere for now. Both Spain and Portugal are EUR. Don't over-engineer it. Time zones are all CET so don't worry about that. Tax — this is where it gets interesting, the VAT in Portugal is different from Spain and the receipts have to comply. But again, the receipt comes out of BCN-Touch, not out of the reservation platform. So I think we're OK.
+
+Tom: We'll confirm that with David and the BCN-Touch docs. Noted. Now, on the payments side — do you take deposits today? Charge no-show fees?
+
+David: Some restaurants do, some don't. The flagship takes a 20-euro deposit on weekend dinners, refundable if the reservation is honored or canceled with 24h notice. Most don't take anything. We want the platform to support deposits, no-show fees, and prepaid tasting menus, configurable per restaurant. Some restaurants want to charge 50% upfront for the chef's table, which is forty euros a head for nine seats, that kind of thing. So flexible deposit rules.
+
+Tom: OK. Stripe presumably, given Spain and Portugal?
+
+David: Stripe is fine. We have a Stripe account already for the loyalty redemption flow — we sell some merch through it, hats, aprons, that kind of thing. So the account is set up and verified. Spain entity, but it'll handle Portugal too once we add a business profile.
+
+Marta: Oh — and please make sure the whole thing is GDPR-compliant. We had a fine three years ago, a small one but it was embarrassing, made the local newspaper. Some manager in the Madrid restaurant kept a personal Excel of customers' birthdays and somebody filed a complaint. So now I am paranoid. I don't want to go through that again.
+
+Lucia: Of course. Right to access, right to erasure, data portability, the standard stuff. We'll add a section for it in the platform admin.
+
+Marta: And export. Like, if a customer asks me for their data, I want one button. One button, click, generates a PDF, sends it to them. Not a process where the manager has to go to four screens.
+
+Lucia: Yeah, that's part of the DSAR flow. Standard.
+
+David: One more — and we keep forgetting this — HubSpot. Marketing pushes everything through HubSpot. Customer signups, big spenders, anniversaries, win-back campaigns. Today they pull a CSV every month from each restaurant, manually, and it's a disaster, the data is stale, it's full of duplicates because the same customer in two restaurants has two records, the segmentation is a mess. The reservation system should sync customers to HubSpot continuously, dedup on email, and tag them with relevant attributes — visit count, last visit, lifetime value, loyalty tier, preferred restaurant.
+
+Tom: OK that's a real integration, noted. Bidirectional or just from us to HubSpot?
+
+David: From us to HubSpot, mostly. But HubSpot has the marketing email opt-in flag, we need to read that back so we don't send notifications to people who unsubscribed in HubSpot. So bidirectional for that one flag, basically.
+
+Tom: OK, that's actually simpler than full bidirectional sync. Good.
+
+Marta: Timing-wise — David and I were talking — it would be ideal to launch with the new flagship in Madrid, which opens... when, David?
+
+David: Soft launch in late September, hard launch the week of the food fair, first week of October. So we want the system in production at one restaurant by end of September, ideally with two weeks of buffer for the soft-launch chaos, so realistically early September.
+
+Marta: So September. Ideally we'd be live by September. I know you'll tell me that's tight.
+
+Tom: It's tight but not impossible, depends on scope. I want to be honest with you — the SAP, sorry, the BCN-Touch piece, plus the loyalty integration on top of a custom reservation engine, with intelligent suggestions, multi-tenant for fifteen restaurants in two countries, in five months — that's a lot. We may want to phase it. Reservation core, loyalty integration and BCN-Touch enrichment for September, HubSpot continuous sync and the smart suggestions later. The international rollout for Portugal can also be phase two — the system is multi-language from day one, but we don't need to actually onboard a Portuguese restaurant in September.
+
+Marta: I can live with that. Phase one for September, phase two by Christmas, phase three early next year for the recommender. And the budget — we have around thirty thousand for phase one. We could stretch to thirty-five if it really has to. Don't take that as an invitation though. And David is keeping me honest on this.
+
+David: I am.
+
+Lucia: Understood. We'll come back with a detailed estimate by Friday. Anything else we should know before we move into the technical part of this call?
+
+David: Accessibility. Schools and public bodies sometimes book the private dining room for events — local council dinners, that kind of thing — and they require WCAG AA at minimum. So accessibility is a non-negotiable.
+
+Marta: Yes, accessibility, important. And — last thing on my side, then I have to drop in twenty minutes — the existing data. The Barcelona system has like four years of reservations in it, customer records, notes the managers have written by hand into the freelancer's tool, all of that. We want that imported. Not optional. The customer history is half the value of doing this in-house.
+
+Tom: Migration of legacy data, noted. What format is the Barcelona data in?
+
+David: PostgreSQL. The freelancer at least had the decency to use a real database. Schema is, uh, idiosyncratic. There's a notes field that's literally a free-text field where managers wrote things like "always wants table 7" or "allergic to peanuts, husband is a celebrity, do not photograph". We want to keep all of that.
+
+Tom: Wow, OK. We'll need an ETL with some classification. Noted. Marta, thanks, this was incredibly useful. Should we do the technical deep-dive now with David and Pablo?
+
+Marta: Yes please, I'll listen to the recording later. David, I trust you. Pablo if you're there, hi.
+
+Pablo: Hola Marta. Hola Tom, Lucia.
+
+Marta: Bye everyone, talk Friday.
+
+[Marta drops]
+
+=== PART 2 — Technical deep-dive ===
+
+Tom: OK Pablo, welcome. Let me catch you up on what we covered. The short version is: custom reservation platform across fifteen restaurants in two countries, integrated with the loyalty backend you maintain, integrated with BCN-Touch POS for cover enrichment, GDPR-strict, HubSpot bidirectional for the marketing flag, multi-language, web-first with PWA for the customer side and tablet-optimized responsive for the manager side. Phase one targets September, budget around thirty thousand euros, can stretch to thirty-five.
+
+Pablo: Got it. And the smart recommendations are phase three, right? Let me focus on phase one then.
+
+David: Correct, phase one is the reservation core, loyalty integration, BCN-Touch enrichment, and the customer migration from Barcelona's legacy database. Plus admin and operations dashboards. Phase two adds HubSpot bidirectional sync and Portugal launch. Phase three adds the recommender.
+
+Pablo: OK. Tom, can I ask about the architecture you have in mind?
+
+Tom: I was going to ask you the same. What's your team comfortable with?
+
+Pablo: We're a Java shop on the loyalty side, but for the reservation thing I don't think we want another Java service, honestly. The team is small, three of us plus David. I'd prefer something that lets us iterate fast. Python, Node, even Go. Whatever your team is good with — we'll be the integration partners on the loyalty side, we won't own the reservation codebase ourselves, you will.
+
+Tom: Good, that gives us flexibility. We'd default to Python, FastAPI on the backend, React for the customer-facing web and the manager tablet UI. Postgres for the data layer. AWS for infra since you already have an account.
+
+Pablo: Yes, AWS Madrid region, eu-south-2. We have an organization with several accounts, we'd give you a dedicated one for this. ECS Fargate is what we use for everything else, that would simplify ops if you went that way. Or App Runner. Or Lambda for the lighter stuff. Up to you.
+
+Tom: ECS Fargate is fine. We've used it a lot. Containers, no servers, scales fine for your traffic.
+
+Pablo: What's your traffic estimate, by the way? David, you have those numbers?
+
+David: Daily reservations across all fifteen restaurants is around two thousand on a normal day, three thousand on a weekend. The customer-facing search and availability check is more — people browse, especially on mobile, so I'd say twenty thousand availability queries on a normal day, fifty thousand on a busy weekend. Spread over twelve hours of opening time but obviously bursty around 7pm local time when everyone decides where to eat tonight.
+
+Tom: OK so peak QPS for availability lookups is maybe a few hundred per second. Reservation writes are a tiny fraction of that, dozens per second peak. Totally fine for ECS with autoscaling. We'll want availability lookups cached aggressively.
+
+Pablo: Yes, please. Today every availability query hits the database and it's a mess. Redis layer, please.
+
+Tom: Redis layer. ElastiCache. Good. Now multi-tenant strategy — fifteen restaurants growing to maybe fifty by the end of next year. How do we isolate them?
+
+Pablo: I have an opinion on this. Schema-per-tenant gets ugly fast — migrations are a nightmare, cross-tenant analytics queries are a pain. I'd go with a shared schema, tenant_id column on every relevant table, row-level security in Postgres. We do that on the loyalty side and it's been fine.
+
+Tom: Agreed. Shared schema, tenant_id everywhere, RLS policies. The HQ analytics queries can go cross-tenant by being run with a special role. We'll use Postgres logical replication to a read replica for the analytics workload so we don't hit the operational database with heavy aggregations.
+
+David: That's fine. We have a budget for a small read replica. What about the reservation engine itself? That's the heart of this. How do we model availability?
+
+Tom: Right. So the way I'd model it — each restaurant has a configurable layout: tables with a min and max party size, optional zones (terrace, main hall, private), and time slots based on opening hours and turn time. The default turn time is, say, 90 minutes for dinner, 60 for lunch, but configurable per restaurant and per zone.
+
+Pablo: And per service? Some restaurants have lunch service that's faster than dinner, you'd want different turn times.
+
+Tom: Per service, yes. Good. So for any given (restaurant, date, party_size, requested_time) we compute a set of valid (table, slot) combinations that don't conflict with existing reservations. The conflict check is a Postgres range query on a reservation table with a tstzrange column, with a GIST index. That gives us fast availability lookups even with thousands of reservations.
+
+Pablo: tstzrange with exclusion constraints, even? So the database itself enforces no-overlap per table?
+
+Tom: Yes. EXCLUDE USING gist (table_id WITH =, time_range WITH &&). That way the integrity is at the database level — it's impossible to double-book by accident, even if there's a race condition in the application code.
+
+Pablo: I like that. We had a double-booking incident in the legacy Barcelona system once and it was a small disaster. The customers were both already there, the manager had to comp a meal.
+
+David: Yeah, that was bad. So that's a hard requirement: no double-booking, and the integrity must survive concurrent writes.
+
+Tom: Database-level exclusion constraint. Done.
+
+David: What about overbooking? Some restaurants deliberately overbook by ten percent because of no-shows. The flagship, in fact, does this on weekends.
+
+Tom: Configurable per restaurant. The exclusion constraint enforces no two reservations on the same physical table at the same time, but the manager can mark a reservation as "wait list" or "stand-up bar" which doesn't lock a table. And the booking widget can show "book anyway, you'll be seated when a table opens up" with an estimated wait. We'd need to model that explicitly.
+
+Pablo: OK, complex. Phase one or phase two?
+
+Tom: Phase one. Otherwise the flagship can't move off the freelancer's system. We'll do it but we'll keep the UX simple — just a "join wait list" option below the regular slots.
+
+David: Good. Now let's talk about the loyalty integration in more detail. Pablo, walk Tom through what you'd want.
+
+Pablo: Sure. So when a customer makes a reservation, we want to call our loyalty service to (a) link the customer record if it exists by email or phone, (b) accrue points when the reservation is honored — that's done from the POS today but we want the reservation system to know the customer's current tier, which affects perks like priority booking. So at booking time, we read from loyalty: is this email a known customer, what's their tier, how many points. At seating time, we don't write — that's still the POS's job. At cancellation, again no write — the POS handles the no-show fee charge if any.
+
+Tom: So from our perspective, loyalty is mostly a read-only dependency at booking time. Good. We'll cache the loyalty lookup for, what, an hour?
+
+Pablo: Fifteen minutes is fine. Tier changes are rare but they do happen during the day if someone hits a threshold.
+
+Tom: Fifteen minutes. And if loyalty is down, we degrade gracefully — the booking still works, we just don't show the tier and we queue an event for backfill when it's back up.
+
+Pablo: Perfect. That's exactly what we want. Don't make the booking flow depend on loyalty being up.
+
+Tom: BCN-Touch integration. David, how does that work?
+
+David: BCN-Touch runs locally at each restaurant on a Windows server, exposes a REST API on the local network. We have a VPN from HQ to each restaurant. The API has endpoints for ticket creation, ticket lookup, customer lookup, but the relevant one for us is patch_ticket — when a reservation is seated, the host opens a ticket in BCN-Touch, and we want to call patch_ticket with our reservation_id and customer_id so the resulting bill in SAP can be tied back to the reservation. That's all phase one needs.
+
+Tom: From the platform, we can't easily reach the local BCN-Touch instance through the VPN — that would mean our backend is inside the VPN, which it isn't. I'd put a small relay agent in each restaurant. It's a tiny container running on a local mini-PC, it polls our backend for events that need to go to BCN-Touch, and pushes locally. That way the restaurant network only needs outbound HTTPS to our backend, no inbound at all.
+
+Pablo: Polling? Why not push from your backend?
+
+Tom: Push means our backend needs to know each restaurant's network, which means VPN, which means more attack surface. Pull means the restaurant always initiates the connection. Standard pattern for IoT-style edge integrations. The latency is fine — a few seconds at most, and the BCN-Touch update is not real-time-critical, the bill closes long after seating.
+
+Pablo: Makes sense. Who maintains those mini-PCs?
+
+David: Same hardware that runs the kiosk and the kitchen display. We already have that in every restaurant. We can just deploy a Docker container on it, we have the orchestration tooling, it's Portainer-based. The restaurant IT person — usually that's me remotely — can deploy and update.
+
+Tom: Perfect. So we ship a small Go binary in a container, it's tiny. Health-checked from our backend, alerting if any restaurant goes silent for more than five minutes during business hours.
+
+Pablo: Yeah. Now, HubSpot. Phase two but let me ask anyway because it'll affect the data model.
+
+Tom: Sure.
+
+Pablo: HubSpot has a contacts API and a webhooks system. The continuous sync from us to HubSpot is straightforward — every customer change emits an event, a worker consumes it, calls HubSpot. We dedup on email. We tag with attributes. Standard. The bidirectional bit for the marketing opt-in flag — HubSpot will fire a webhook to us when the contact's marketing_email_opt_in changes. We need an endpoint to receive that, validate the HubSpot signature, update our customer record. For the marketing opt-in flag specifically, I would also propose we treat it as authoritative on the HubSpot side — if it's set there, it's set, period. That avoids weird race conditions where a manager toggles it in our admin and HubSpot also toggles it from a marketing campaign.
+
+Tom: Agreed. Single source of truth for the opt-in flag is HubSpot. Our admin shows it as read-only with a "last synced" indicator.
+
+David: Good. OK, what about authentication? Customers, managers, regional managers, HQ admins, chefs.
+
+Tom: Customers: passwordless email magic links plus optional Google/Apple SSO. Managers and regional managers and HQ: company SSO via OAuth — what do you use today?
+
+David: We use Microsoft Entra. So OIDC via Entra.
+
+Tom: OIDC with Entra for staff. Customers with magic links and social login. We won't store passwords — that simplifies a lot. RBAC with five roles: customer, manager, regional_manager, hq_admin, hq_analyst. The chef is a custom view on top of the manager role, not a separate role, just a different default dashboard.
+
+Pablo: Good. Now, GDPR. You mentioned data export and deletion. Let me ask about residency.
+
+Tom: AWS eu-south-2 for the platform. eu-west-1 for the read replica if needed. All EU. No US transfers. Stripe data — Stripe handles their own residency, we just store Stripe customer and payment_intent IDs, not card data. HubSpot is US-based, we'd need a Standard Contractual Clause in place, which I think you already have given you use them today.
+
+David: Yes, we have an SCC with HubSpot. Legal sorted that out a while ago.
+
+Tom: For the right-to-erasure, the tricky part is the loyalty system — when a customer asks to be deleted, we delete from our reservation database, but the loyalty ledger needs to keep the historical accrual records for accounting purposes. So we anonymize the loyalty record — replace the email and name with hashed identifiers, keep the ledger entries. Pablo, you OK with that pattern?
+
+Pablo: Yes, that's what we already do internally for the GDPR cases we've handled. Emails get replaced with a deterministic hash, name becomes "Deleted User N", and the ledger keeps the points history for the seven-year accounting window we have to keep.
+
+Tom: Perfect, that aligns. Now, notifications. Marta wants email reminders, push if there's a mobile flow eventually, SMS optional.
+
+David: Email definitely. SMS is nice-to-have. Push only if we go native, which we're not in phase one. Let's say email only for phase one with the architecture allowing SMS to be added easily.
+
+Tom: Provider for email?
+
+David: Today we use Mailgun for the loyalty redemption confirmations. Same account is fine, we have plenty of headroom.
+
+Tom: Mailgun, good. SMS can be Twilio or MessageBird. We'll abstract the provider behind an interface.
+
+Pablo: One thing: the email templates. Each restaurant has its own brand — fonts, colors, logo. So the templates need to be per-tenant. We have a templates table on the loyalty side for the redemption emails, the reservation system can do the same.
+
+Tom: Yes. Per-tenant templates, MJML for the source so they're maintainable, rendered to HTML at send time, multi-language by template variant.
+
+David: OK. Migration. The Barcelona PostgreSQL data. Walk me through the approach.
+
+Tom: We write a one-shot ETL that reads from a Barcelona snapshot — David, you'll provide a `pg_dump` — transforms the schema into our model, classifies the manager notes into structured fields where possible (allergies, table preferences, VIP flag), keeps the original note as a `legacy_note` field for human review. We run it once in staging, you and the Barcelona manager review the output, you sign off, then we run it once in production at cutover. Anything written in the freelancer's system after the snapshot is captured by a delta script that runs once at cutover.
+
+Pablo: How long is the freeze window for cutover?
+
+Tom: A couple of hours, ideally overnight. Barcelona's last seating is at 11pm, they don't take more reservations after midnight, we cut over between 1am and 5am. The customers don't notice. The Saturday morning manager sees the new system.
+
+David: Good. What about testing?
+
+Tom: Stripe test mode for payments, naturally. Cypress for the customer-facing flows. The manager UI gets a separate suite because the touch interactions are different. Contract tests against the loyalty service — we have your OpenAPI spec, we generate a fake from it and we test against the fake. Plus end-to-end against a staging instance of your loyalty service before each release. BCN-Touch we'll mock, you'll provide a recording of real interactions for fixture data. Load test the availability lookup against the cached layer at, let's say, ten times peak QPS, just to be safe.
+
+Pablo: I'd add — please write a small chaos test for the loyalty downtime case. Kill the loyalty service during a booking flow and verify the booking still completes with degraded fields. We've been bitten by hard dependencies before.
+
+Tom: Will do. CI runs on every PR, deploy to staging is automatic on main, deploy to production is manual approval.
+
+David: Observability?
+
+Tom: CloudWatch for metrics and logs. We'll add a Datadog free trial for traces, and if we like it we'll formalize it. Sentry for application errors, you already have a license I believe.
+
+David: Yes, we have Sentry company-wide.
+
+Tom: Good. Alerts on: error rate, latency P95 of availability and booking endpoints, loyalty integration failure rate, Mailgun delivery failures, and BCN-Touch agent disconnections during business hours.
+
+Pablo: One more thing on the data model — the customer notes from the manager. Marta mentioned things like "allergic to peanuts, husband is a celebrity, do not photograph". That's GDPR-sensitive. Health data is special category under GDPR. Photographic identifiability is also sensitive.
+
+Tom: Excellent point. We'll model customer notes as structured fields where possible — allergies as a controlled vocabulary, dietary preferences likewise, accessibility needs likewise — and a separate "private notes" free-text field that's encrypted at rest with a per-tenant key, only visible to managers of that restaurant, and audit-logged on every read.
+
+Pablo: That's the right answer. Audit log access is non-negotiable for the private notes.
+
+David: Good. We're at time, almost. Tom, Lucia, anything else you need from us this week to put together the estimate?
+
+Tom: A few things. The BCN-Touch API documentation. The loyalty service OpenAPI spec. A pg_dump of the Barcelona database, anonymized for the parts we don't strictly need yet. A brief from Marta on the brand tokens and any Figma file for the customer-facing UI. And the names of the regional managers we'll user-test the manager UI with in week six or seven.
+
+David: I'll send all of that by tomorrow EOD. Lucia, you have my email.
+
+Lucia: Got it. We'll have a detailed estimate Friday by 1pm and a follow-up call Monday at the same time as today. Sound good?
+
+David: Sounds good.
+
+Pablo: Sounds good. Tom, looking forward to working together.
+
+Tom: Likewise. Thanks Pablo, thanks David. Bye.
+
+[end of recording]
