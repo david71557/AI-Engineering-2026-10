@@ -12,6 +12,15 @@ services:
     env_file:
       - .env
 
+    # Override REDIS_URL for the in-network Redis service. The .env value
+    # (redis://localhost:6379) is meant for running uvicorn outside Docker.
+    environment:
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
     # Bind-mount the app/ directory so code changes are reflected immediately
     # inside the container without rebuilding the image.
     volumes:
@@ -30,3 +39,20 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: estimator-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  redis_data:

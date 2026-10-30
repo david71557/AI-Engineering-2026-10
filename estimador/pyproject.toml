@@ -11,4 +11,8 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
     "structlog>=24.0",
     "streamlit>=1.40",
+    "litellm>=1.50",
+    "redis>=8.1.0",
+    "sse-starlette>=2.1",
+    "tiktoken>=0.14.0",
 ]

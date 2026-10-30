@@ -1,19 +1,19 @@
 """Estimation orchestration: prompt building, optional preprocessing, and dispatch
-to the LLM (OpenAI) through the ``_invoke_llm`` / ``_invoke_llm_stream`` seams.
+to the LLM. The actual provider calls now live in :mod:`app.services.llm_wrapper`,
+so this module focuses on Session 2 concerns (knobs, prompt assembly) while the
+wrapper handles cache, fallback, and cost tracking transparently.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from openai import OpenAI
 
-from app.config import get_settings
 from app.context.examples import format_examples_for_prompt, select_examples
+from app.dependencies import get_llm_wrapper
 from app.schemas.estimation import ExampleFormat, PreprocessingMode
 
 log = structlog.get_logger()
@@ -145,87 +145,15 @@ def _invoke_llm(
     max_tokens: int,
     thinking_budget: int | None,
 ) -> dict[str, Any]:
-    """Single seam through which every LLM call passes. Tests monkeypatch this.
-
-    ``thinking_budget`` is accepted for interface compatibility but ignored: it is
-    an Anthropic-only feature and this seam talks to OpenAI.
-    """
-    settings = get_settings()
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    model = model_override or settings.LLM_MODEL
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+    """Single seam through which every LLM call passes. Tests monkeypatch this."""
+    wrapper = get_llm_wrapper()
+    return wrapper.complete(
+        system_prompt=system_prompt,
+        user_message=user_message,
+        model_override=model_override,
         max_tokens=max_tokens,
+        thinking_budget=thinking_budget,
     )
-
-    usage = response.usage
-    finish_reason = response.choices[0].finish_reason or "stop"
-
-    log.info(
-        "llm_response_received",
-        provider="openai",
-        model=response.model,
-        finish_reason=finish_reason,
-        input_tokens=usage.prompt_tokens,
-        output_tokens=usage.completion_tokens,
-    )
-
-    return {
-        "estimation": response.choices[0].message.content,
-        "model": response.model,
-        "provider": "openai",
-        "finish_reason": finish_reason,
-        "usage": {
-            "input_tokens": usage.prompt_tokens,
-            "output_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        },
-    }
-
-
-def _invoke_llm_stream(
-    *,
-    system_prompt: str,
-    user_message: str,
-    model_override: str | None,
-    max_tokens: int,
-    usage: dict[str, Any] | None = None,
-) -> Iterator[str]:
-    """Streaming counterpart of ``_invoke_llm``: yields text deltas as they arrive.
-
-    If ``usage`` is given, it is filled with ``model``, ``input_tokens`` and
-    ``output_tokens`` once the stream ends.
-    """
-    settings = get_settings()
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    model = model_override or settings.LLM_MODEL
-
-    stream = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        max_tokens=max_tokens,
-        stream=True,
-        # Ask OpenAI to append a final chunk (with empty ``choices``) carrying token usage.
-        stream_options={"include_usage": True},
-    )
-
-    for chunk in stream:
-        # The first chunk only carries the role and the last ones only the
-        # finish_reason / usage; skip anything without text.
-        if chunk.choices and chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
-        if chunk.usage is not None and usage is not None:
-            usage["model"] = chunk.model
-            usage["input_tokens"] = chunk.usage.prompt_tokens
-            usage["output_tokens"] = chunk.usage.completion_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +164,10 @@ def _invoke_llm_stream(
 def extract_requirements(
     transcription: str,
     opts: GenerationOptions,
-) -> tuple[str, dict]:
+) -> tuple[str, dict, float]:
     """Run the cheap phase-1 LLM call that turns a raw transcription into clean requirements.
 
-    Returns ``(requirements_text, usage_dict)``.
+    Returns ``(requirements_text, usage_dict, cost_usd)``.
     """
     log.info("extracting_requirements", model_override=opts.model)
 
@@ -257,6 +185,7 @@ def extract_requirements(
             "input": result["usage"]["input_tokens"],
             "output": result["usage"]["output_tokens"],
         },
+        float(result.get("cost_usd", 0.0)),
     )
 
 
@@ -275,11 +204,12 @@ def generate_estimation(
     t0 = time.perf_counter()
 
     prep_usage = {"input": 0, "output": 0}
+    prep_cost = 0.0
     extracted_requirements: str | None = None
     user_input = transcription
 
     if opts.preprocessing == "two_phase":
-        extracted_requirements, prep_usage = extract_requirements(transcription, opts)
+        extracted_requirements, prep_usage, prep_cost = extract_requirements(transcription, opts)
         user_input = extracted_requirements
 
     system_prompt = build_system_prompt(
@@ -317,47 +247,8 @@ def generate_estimation(
     result["preprocessing"] = opts.preprocessing
     result["extracted_requirements"] = extracted_requirements
     result["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+    result["cost_usd"] = round(float(result.get("cost_usd", 0.0)) + prep_cost, 6)
+    # ``cache_hit`` is whatever the wrapper returned for the main estimation call.
+    result.setdefault("cache_hit", False)
 
     return result
-
-
-def stream_estimation(
-    transcription: str,
-    opts: GenerationOptions | None = None,
-    usage: dict[str, Any] | None = None,
-) -> Iterator[str]:
-    """Stream a software estimation token by token, using the same system prompt.
-
-    Pass a dict as ``usage`` to receive the model and token counts when the
-    stream finishes. Two-phase preprocessing is not supported here: phase 1
-    would run silently before the first token, defeating the point of streaming.
-    """
-    opts = opts or GenerationOptions()
-
-    system_prompt = build_system_prompt(
-        example_format=opts.example_format,
-        num_examples=opts.num_examples,
-        use_examples=opts.use_examples,
-        inline_cleaning=(opts.preprocessing == "inline_cleaning"),
-    )
-
-    log.info(
-        "streaming_estimation",
-        model_override=opts.model,
-        example_format=opts.example_format,
-        num_examples=opts.num_examples,
-        use_examples=opts.use_examples,
-        max_tokens=opts.max_tokens,
-    )
-
-    try:
-        yield from _invoke_llm_stream(
-            system_prompt=system_prompt,
-            user_message=transcription,
-            model_override=opts.model,
-            max_tokens=opts.max_tokens,
-            usage=usage,
-        )
-    except Exception as exc:
-        log.error("llm_stream_failed", error=str(exc), error_type=type(exc).__name__)
-        raise LLMServiceError(f"LLM call failed: {exc}") from exc
