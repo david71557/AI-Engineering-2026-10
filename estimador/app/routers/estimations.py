@@ -7,51 +7,52 @@ from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from app.dependencies import get_llm_wrapper
+from app.prompts import render_estimation_prompt
 from app.schemas.estimation import (
     EstimationRequest,
     EstimationResponse,
     StreamEstimationRequest,
 )
-from app.services.evaluation import evaluate_estimation_structure
-from app.services.llm_service import (
-    GenerationOptions,
-    LLMServiceError,
-    build_system_prompt,
-    generate_estimation,
-)
+from app.services.llm_service import build_system_prompt
 from app.services.llm_wrapper import LLMWrapper
 
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["estimations"])
 
+PROMPT_VERSION = "v1"
 
+
+# Plain `def`: wrapper.complete() blocks on the LLM call, so FastAPI runs this
+# in its threadpool instead of stalling the event loop.
 @router.post("/estimate", response_model=EstimationResponse)
-async def create_estimation(request: EstimationRequest) -> EstimationResponse:
-    """Receive a meeting transcription and return a software project estimation."""
-    opts = GenerationOptions(
-        preprocessing=request.preprocessing,
-        example_format=request.example_format,
-        num_examples=request.num_examples,
-        use_examples=request.use_examples,
-        model=request.model,
-        max_tokens=request.max_tokens,
-        thinking_budget=request.thinking_budget,
+def create_estimation(
+    request: EstimationRequest,
+    wrapper: LLMWrapper = Depends(get_llm_wrapper),
+) -> EstimationResponse:
+    """Render the versioned prompt pair and ask the LLM for an estimation."""
+    system_prompt, user_message = render_estimation_prompt(request, version=PROMPT_VERSION)
+
+    log.info(
+        "estimation_request_received",
+        prompt_version=PROMPT_VERSION,
+        project_type=request.project_type.value,
+        detail_level=request.detail_level.value,
+        output_format=request.output_format.value,
+        description_chars=len(request.description),
     )
 
     try:
-        result = generate_estimation(request.transcription, opts)
-    except LLMServiceError as exc:
-        log.error("estimation_endpoint_error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
+        # The wrapper sends these as separate role: "system" / role: "user" messages.
+        result = wrapper.complete(
+            system_prompt=system_prompt,
+            user_message=user_message,
+        )
+    except Exception as exc:
+        log.error("estimation_endpoint_error", error=str(exc), error_type=type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Upstream LLM call failed") from exc
 
-    validation = (
-        evaluate_estimation_structure(result["estimation"], result["finish_reason"])
-        if request.evaluate
-        else None
-    )
-
-    return EstimationResponse(**result, validation=validation)
+    return EstimationResponse(text=result["estimation"], prompt_version=PROMPT_VERSION)
 
 
 @router.post("/estimate/stream")
