@@ -12,13 +12,16 @@ import itertools
 
 import pytest
 from jinja2 import TemplateNotFound, UndefinedError
+from pydantic import ValidationError
+from structlog.testing import capture_logs
 
-from app.prompts.loader import _env, render_estimation_prompt
+from app.prompts.loader import _env, content_hash, render_estimation_prompt
 from app.schemas.estimation import (
     DetailLevel,
     EstimationRequest,
     OutputFormat,
     ProjectType,
+    ReferenceProject,
 )
 
 
@@ -106,3 +109,79 @@ def test_loader_environment_raises_on_missing_variable() -> None:
 def test_unknown_version_raises() -> None:
     with pytest.raises(TemplateNotFound):
         render_estimation_prompt(_make_request(), version="v999")
+
+
+def _render_and_capture(request: EstimationRequest, version: str = "v1") -> tuple[str, str, dict]:
+    with capture_logs() as logs:
+        system, user = render_estimation_prompt(request, version=version)
+    events = [entry for entry in logs if entry["event"] == "prompt_rendered"]
+    assert len(events) == 1
+    return system, user, events[0]
+
+
+def test_render_logs_version_and_hashes_but_not_the_prompt_text() -> None:
+    description = "UNIQUE-MARKER-67890 build a tiny scheduling app for dentists."
+    system, user, event = _render_and_capture(_make_request(description=description))
+
+    assert event["prompt_version"] == "v1"
+    assert event["system_hash"] == content_hash(system)
+    assert event["user_hash"] == content_hash(user)
+    assert event["user_chars"] == len(user)
+    # Client data must never reach the logs, only its fingerprint.
+    assert "UNIQUE-MARKER-67890" not in repr(event)
+
+
+def test_template_hash_tracks_the_template_not_the_input() -> None:
+    _, _, first = _render_and_capture(_make_request(description="First project description, long enough."))
+    _, _, second = _render_and_capture(_make_request(description="Second, completely different description."))
+    _, _, other_version = _render_and_capture(_make_request(), version="v2")
+
+    assert first["template_hash"] == second["template_hash"]
+    assert first["user_hash"] != second["user_hash"]
+    assert other_version["template_hash"] != first["template_hash"]
+
+
+def _reference(**overrides) -> ReferenceProject:
+    base = {
+        "name": "Physio booking",
+        "description": "Booking SaaS for physiotherapy clinics with Stripe deposits.",
+        "duration_weeks": 13,
+        "cost_eur": 39650,
+        "team": "1 designer, 2 developers",
+    }
+    base.update(overrides)
+    return ReferenceProject(**base)
+
+
+def test_reference_projects_are_rendered_in_order_inside_user_prompt() -> None:
+    references = [
+        _reference(name="REF-ALPHA"),
+        _reference(name="REF-BETA", duration_weeks=8.5, cost_eur=22000, team=None),
+    ]
+    system, user = render_estimation_prompt(_make_request(reference_projects=references))
+
+    block = _section(user, "reference_projects")
+    assert block.count("<reference_project ") == 2
+    assert block.index("REF-ALPHA") < block.index("REF-BETA")
+    assert 'index="1"' in block and 'index="2"' in block
+    assert "Duration: 13 weeks" in block and "Cost: 39,650 EUR" in block
+    assert "Duration: 8.5 weeks" in block and "Cost: 22,000 EUR" in block
+    # The Team line is optional: only the first reference has one.
+    assert block.count("Team:") == 1
+    # User-provided data stays in the user prompt; the system prompt only gets the usage rule.
+    assert "REF-ALPHA" not in system
+    assert "<reference_projects> lists comparable past projects" in system
+
+
+@pytest.mark.parametrize("empty", [None, []])
+def test_no_reference_projects_renders_no_block_and_no_rule(empty) -> None:
+    system, user = render_estimation_prompt(_make_request(reference_projects=empty))
+
+    assert "reference_project" not in user
+    assert "reference_projects" not in system
+    assert "</project_description>\n\nProject type:" in user
+
+
+def test_more_than_five_reference_projects_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _make_request(reference_projects=[_reference() for _ in range(6)])

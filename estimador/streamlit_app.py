@@ -25,6 +25,7 @@ from app.schemas.estimation import (
     EstimationResponse,
     OutputFormat,
     ProjectType,
+    PromptVersion,
 )
 
 load_dotenv()
@@ -50,6 +51,13 @@ OUTPUT_FORMAT_LABELS = {
     OutputFormat.LINE_ITEMS: "Line items",
     OutputFormat.NARRATIVE: "Narrative",
 }
+# "compare" sends the same request once per version and shows the answers side by side.
+COMPARE_ALL = "compare"
+PROMPT_VERSION_LABELS = {
+    PromptVersion.V1: "v1 · technical consultant",
+    PromptVersion.V2: "v2 · plain language for founders",
+    COMPARE_ALL: "Compare all versions side by side",
+}
 
 # Mirror the server-side Field constraints so the text area enforces them too.
 _description_field = EstimationRequest.model_fields["description"]
@@ -57,10 +65,11 @@ DESCRIPTION_MIN = next(m.min_length for m in _description_field.metadata if hasa
 DESCRIPTION_MAX = next(m.max_length for m in _description_field.metadata if hasattr(m, "max_length"))
 
 
-def request_estimation(request: EstimationRequest) -> EstimationResponse:
+def request_estimation(request: EstimationRequest, prompt_version: PromptVersion) -> EstimationResponse:
     """POST the request as JSON and parse the service's response."""
     response = httpx.post(
         ESTIMATE_ENDPOINT,
+        params={"prompt_version": prompt_version.value},
         json=request.model_dump(mode="json"),
         timeout=httpx.Timeout(120.0, connect=10.0),
     )
@@ -105,6 +114,11 @@ with st.form("estimation_form"):
         options=list(OutputFormat),
         format_func=OUTPUT_FORMAT_LABELS.get,
     )
+    prompt_version_choice = st.selectbox(
+        "Prompt version",
+        options=[*PromptVersion, COMPARE_ALL],
+        format_func=PROMPT_VERSION_LABELS.get,
+    )
     submitted = st.form_submit_button("Estimate", type="primary")
 
 if submitted:
@@ -122,32 +136,43 @@ if submitted:
             field = ".".join(str(part) for part in error["loc"])
             st.error(f"**{field}**: {error['msg']}")
     else:
+        versions = list(PromptVersion) if prompt_version_choice == COMPARE_ALL else [prompt_version_choice]
+        runs = []
         with st.spinner("Generating estimation..."):
-            t0 = time.perf_counter()
             try:
-                result = request_estimation(estimation_request)
+                for version in versions:
+                    t0 = time.perf_counter()
+                    runs.append(
+                        {
+                            "response": request_estimation(estimation_request, version),
+                            "latency_ms": int((time.perf_counter() - t0) * 1000),
+                        }
+                    )
             except (httpx.HTTPError, ValidationError) as exc:
                 st.session_state.last_result = None
                 st.error(f"Could not get an estimation from `{ESTIMATE_ENDPOINT}`: {exc}")
             else:
-                st.session_state.last_result = {
-                    "request": estimation_request,
-                    "response": result,
-                    "latency_ms": int((time.perf_counter() - t0) * 1000),
-                }
+                st.session_state.last_result = {"request": estimation_request, "runs": runs}
 
 last = st.session_state.last_result
+if last and "runs" not in last:
+    # Result stored by an older version of this page during a hot reload.
+    last = st.session_state.last_result = None
 if last:
     st.divider()
     st.subheader("Estimation")
-    st.markdown(last["response"].text)
+    columns = st.columns(len(last["runs"]))
+    for column, run in zip(columns, last["runs"]):
+        if len(last["runs"]) > 1:
+            column.markdown(f"#### Prompt `{run['response'].prompt_version}`")
+        column.markdown(run["response"].text)
 
 
 with st.sidebar:
     st.header("Last call")
     if last:
-        st.metric("Response time", f"{last['latency_ms'] / 1000:.2f} s")
-        st.markdown(f"**Prompt version:** `{last['response'].prompt_version}`")
+        for run in last["runs"]:
+            st.metric(f"Response time · {run['response'].prompt_version}", f"{run['latency_ms'] / 1000:.2f} s")
         with st.expander("Request JSON"):
             st.json(last["request"].model_dump(mode="json"))
     else:

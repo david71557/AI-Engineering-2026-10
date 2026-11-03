@@ -26,6 +26,23 @@ class OutputFormat(str, Enum):
     NARRATIVE = "narrative"
 
 
+class PromptVersion(str, Enum):
+    """Prompt template versions on disk under app/prompts/estimation/<version>/."""
+
+    V1 = "v1"
+    V2 = "v2"
+
+
+class ReferenceProject(BaseModel):
+    """A past project the client already delivered, used to calibrate the estimation."""
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=10, max_length=1000)
+    duration_weeks: float = Field(gt=0, le=520)
+    cost_eur: float = Field(ge=0)
+    team: str | None = Field(default=None, max_length=200, description="e.g. '1 designer, 2 developers'")
+
+
 class EstimationRequest(BaseModel):
     """Contract between the client form and the AI service."""
 
@@ -33,6 +50,8 @@ class EstimationRequest(BaseModel):
     project_type: ProjectType
     detail_level: DetailLevel
     output_format: OutputFormat
+    # Capped so a long list can't crowd out the actual description in the prompt.
+    reference_projects: list[ReferenceProject] | None = Field(default=None, max_length=5)
 
 
 class TokenUsage(BaseModel):

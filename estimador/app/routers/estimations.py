@@ -3,7 +3,7 @@ import json
 from collections.abc import AsyncIterator
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
 
 from app.dependencies import get_llm_wrapper
@@ -11,6 +11,7 @@ from app.prompts import render_estimation_prompt
 from app.schemas.estimation import (
     EstimationRequest,
     EstimationResponse,
+    PromptVersion,
     StreamEstimationRequest,
 )
 from app.services.llm_service import build_system_prompt
@@ -20,7 +21,7 @@ log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["estimations"])
 
-PROMPT_VERSION = "v1"
+DEFAULT_PROMPT_VERSION = PromptVersion.V1
 
 
 # Plain `def`: wrapper.complete() blocks on the LLM call, so FastAPI runs this
@@ -28,14 +29,19 @@ PROMPT_VERSION = "v1"
 @router.post("/estimate", response_model=EstimationResponse)
 def create_estimation(
     request: EstimationRequest,
+    prompt_version: PromptVersion = Query(
+        DEFAULT_PROMPT_VERSION,
+        description="Prompt template version to render. Unknown values are rejected with 422.",
+    ),
     wrapper: LLMWrapper = Depends(get_llm_wrapper),
 ) -> EstimationResponse:
     """Render the versioned prompt pair and ask the LLM for an estimation."""
-    system_prompt, user_message = render_estimation_prompt(request, version=PROMPT_VERSION)
+    version = prompt_version.value
+    system_prompt, user_message = render_estimation_prompt(request, version=version)
 
     log.info(
         "estimation_request_received",
-        prompt_version=PROMPT_VERSION,
+        prompt_version=version,
         project_type=request.project_type.value,
         detail_level=request.detail_level.value,
         output_format=request.output_format.value,
@@ -52,7 +58,7 @@ def create_estimation(
         log.error("estimation_endpoint_error", error=str(exc), error_type=type(exc).__name__)
         raise HTTPException(status_code=502, detail="Upstream LLM call failed") from exc
 
-    return EstimationResponse(text=result["estimation"], prompt_version=PROMPT_VERSION)
+    return EstimationResponse(text=result["estimation"], prompt_version=version)
 
 
 @router.post("/estimate/stream")

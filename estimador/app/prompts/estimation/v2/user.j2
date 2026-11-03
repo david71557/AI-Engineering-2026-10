@@ -1,0 +1,22 @@
+<project_description>
+{{ description }}
+</project_description>
+{% if reference_projects %}
+
+<reference_projects>
+{% for project in reference_projects %}
+<reference_project index="{{ loop.index }}">
+Name: {{ project.name }}
+Description: {{ project.description }}
+Duration: {{ "{:g}".format(project.duration_weeks) }} weeks
+Cost: {{ "{:,.0f}".format(project.cost_eur) }} EUR
+{% if project.team %}
+Team: {{ project.team }}
+{% endif %}
+</reference_project>
+{% endfor %}
+</reference_projects>
+{% endif %}
+
+Project type: {{ project_type }}.
+Estimate this project following the rules above.
