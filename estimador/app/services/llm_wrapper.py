@@ -1,26 +1,24 @@
-"""LiteLLM-backed wrapper that adds provider fallback, exact-match cache, cost tracking,
-and structured logging to every LLM call in the estimator.
+"""LiteLLM-backed wrapper that adds provider fallback, cost tracking and
+structured logging to every LLM call in the estimator.
 
 Design notes
 ------------
-- The wrapper exposes two primitives: ``complete()`` (blocking, full response) and
-  ``complete_stream()`` (yields chunks). Higher-level orchestration (preprocessing,
-  validation, prompt building) stays in ``llm_service.py``.
+- Two primitives: ``complete_structured()`` (JSON validated against a Pydantic
+  model, re-prompting on validation errors; the one the pipeline uses) and
+  ``complete()`` (free text with its own exact-match cache, kept for tests and
+  ad-hoc calls). Orchestration (guardrails, caches, prompt rendering) lives in
+  ``app/services/estimation.py``, as in estimator.
 - Both deployments share the ``model_name`` "estimator". Their ``order``
   (1 = primary, 2 = fallback) makes LiteLLM always try the primary first and
   only use the fallback when it fails, instead of load-balancing between them.
-  When the caller overrides the model per-request (Session 2 live demos), we
-  bypass the Router and call ``litellm.completion`` directly with explicit
-  credentials — that path has no fallback by design.
-- The cache key includes the full system prompt and the generation knobs, so any
-  Session 2 toggle (preprocessing, num_examples, ACTIVE_OUTPUT_PROMPT) implicitly
-  invalidates the cache without manual flushing.
+  When the caller overrides the model per-request, we bypass the Router and
+  call ``litellm.completion`` directly — that path has no fallback by design.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator, TypeVar
+from typing import Any, TypeVar
 
 import litellm
 import structlog
@@ -208,14 +206,9 @@ class LLMWrapper:
         through the Router, so the fallback model still applies.
 
         Returns ``(instance, meta)``; ``meta`` holds model, provider, latency_ms,
-        cost_usd, token usage, attempts and cache_hit. Only validated results are
-        cached.
+        cost_usd, token usage and attempts. No caching here: as in estimator, the
+        exact and semantic caches live in ``EstimationService``.
         """
-        cache_key = self._structured_cache_key(system_prompt, user_message, response_model, max_tokens)
-        cached = self._read_structured(cache_key, response_model)
-        if cached:
-            return cached
-
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -294,156 +287,7 @@ class LLMWrapper:
             "attempts": attempt,
         }
         log.info("llm_structured_call_completed", **meta)
-        self.cache.set(cache_key, {"result": result.model_dump(mode="json"), "meta": meta})
-        return result, {**meta, "cache_hit": False}
-
-    def lookup_structured(
-        self,
-        *,
-        system_prompt: str,
-        user_message: str,
-        response_model: type[T],
-        max_tokens: int = 4000,
-    ) -> tuple[T, dict[str, Any]] | None:
-        """Exact-match cache lookup only (no LLM call), same key as ``complete_structured``.
-
-        Lets the caller put other layers (the semantic cache) between the cheap
-        exact lookup and the expensive LLM call.
-        """
-        cache_key = self._structured_cache_key(system_prompt, user_message, response_model, max_tokens)
-        return self._read_structured(cache_key, response_model)
-
-    def _structured_cache_key(
-        self, system_prompt: str, user_message: str, response_model: type[BaseModel], max_tokens: int
-    ) -> str:
-        return EstimationCache.make_key(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            model=f"{self.primary_model}|structured:{response_model.__name__}",
-            max_tokens=max_tokens,
-            thinking_budget=None,
-        )
-
-    def _read_structured(self, cache_key: str, response_model: type[T]) -> tuple[T, dict[str, Any]] | None:
-        cached = self.cache.get(cache_key)
-        if not cached:
-            return None
-        try:
-            result = response_model.model_validate(cached["result"])
-        except (KeyError, ValidationError) as exc:
-            # Entry written under an older schema/validator: treat as a miss.
-            log.warning("structured_cache_entry_invalid", error=str(exc)[:200])
-            return None
-        return result, {**cached["meta"], "cache_hit": True}
-
-    def complete_stream(
-        self,
-        *,
-        system_prompt: str,
-        user_message: str,
-        model_override: str | None = None,
-        max_tokens: int = 4000,
-        meta: dict[str, Any] | None = None,
-    ) -> Iterator[str]:
-        """Yield text chunks as they arrive from the model.
-
-        Cache hits replay the cached estimation as a single chunk so the client UX
-        stays consistent. Cache misses stream live and the full text is cached
-        once the stream finishes (without ``cost_usd`` since LiteLLM does not
-        always report token usage for streaming calls).
-
-        If ``meta`` is given, it is filled with ``model``, ``provider`` and
-        ``cache_hit`` once the stream is exhausted, so callers can tell whether
-        the fallback model served the request.
-        """
-        if meta is None:
-            meta = {}
-        cache_key_model = model_override or self.primary_model
-        cache_key = EstimationCache.make_key(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            model=cache_key_model,
-            max_tokens=max_tokens,
-            thinking_budget=None,
-        )
-        cached = self.cache.get(cache_key)
-        if cached:
-            log.info("stream_cache_hit", chars=len(cached.get("estimation", "")))
-            yield cached.get("estimation", "")
-            meta.update(
-                model=cached.get("model", cache_key_model),
-                provider=cached.get("provider", _provider_from_model(cache_key_model)),
-                cache_hit=True,
-            )
-            return
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-        kwargs = self._build_call_kwargs(
-            messages=messages,
-            max_tokens=max_tokens,
-            thinking_budget=None,
-            model_override=model_override,
-            stream=True,
-        )
-
-        log.info(
-            "llm_stream_started",
-            model=model_override or self.primary_model,
-        )
-        t0 = time.perf_counter()
-        full_text: list[str] = []
-        # The Router may fall back to another deployment, so take the served
-        # model from the chunks rather than assuming the primary one.
-        served_model = model_override or self.primary_model
-        try:
-            response = self._dispatch(model_override=model_override, **kwargs)
-            for chunk in response:
-                served_model = getattr(chunk, "model", None) or served_model
-                delta = _extract_delta(chunk)
-                if delta:
-                    full_text.append(delta)
-                    yield delta
-        except Exception as exc:
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            log.error(
-                "llm_stream_failed",
-                error_type=type(exc).__name__,
-                error=str(exc),
-                latency_ms=latency_ms,
-            )
-            raise
-
-        latency_ms = int((time.perf_counter() - t0) * 1000)
-        rendered = "".join(full_text)
-        served_model = _normalise_model_name(served_model)
-        log.info(
-            "llm_stream_completed",
-            model=served_model,
-            provider=_provider_from_model(served_model),
-            latency_ms=latency_ms,
-            chars=len(rendered),
-        )
-        meta.update(
-            model=served_model,
-            provider=_provider_from_model(served_model),
-            cache_hit=False,
-        )
-
-        self.cache.set(
-            cache_key,
-            {
-                "estimation": rendered,
-                "model": served_model,
-                "provider": _provider_from_model(served_model),
-                "finish_reason": "stop",
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                "latency_ms": latency_ms,
-                "cost_usd": 0.0,
-            },
-        )
+        return result, meta
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -456,15 +300,11 @@ class LLMWrapper:
         max_tokens: int,
         thinking_budget: int | None,
         model_override: str | None,
-        stream: bool = False,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "messages": messages,
             "max_tokens": max_tokens,
         }
-        if stream:
-            kwargs["stream"] = True
-
         if thinking_budget is not None:
             target_model = model_override or self.primary_model
             if _provider_from_model(target_model) == "anthropic":
@@ -531,12 +371,3 @@ def _strip_code_fences(text: str) -> str:
         text = text.rsplit("```", 1)[0]
     return text.strip()
 
-
-def _extract_delta(chunk: Any) -> str:
-    """Pull the text delta out of a LiteLLM streaming chunk."""
-    try:
-        delta = chunk.choices[0].delta
-    except (AttributeError, IndexError):
-        return ""
-    content = getattr(delta, "content", None)
-    return content or ""

@@ -1,4 +1,4 @@
-"""LLMWrapper.complete_structured: JSON validation, re-prompt on error, caching.
+"""LLMWrapper.complete_structured: JSON validation and re-prompt on error.
 
 The LiteLLM Router and Redis are replaced by in-memory fakes, so no API keys
 or network are needed.
@@ -99,7 +99,6 @@ def test_valid_json_first_try() -> None:
 
     assert result.total_cost_eur == 25000
     assert meta["attempts"] == 1
-    assert meta["cache_hit"] is False
     assert meta["cost_usd"] > 0
     assert len(router.calls) == 1
 
@@ -191,11 +190,11 @@ def test_gives_up_after_max_retries() -> None:
     assert len(router.calls) == 3
 
 
-def test_second_identical_call_is_served_from_cache() -> None:
-    wrapper, router = _wrapper([json.dumps(VALID)])
+def test_structured_calls_are_never_cached_by_the_wrapper() -> None:
+    """Caching moved to EstimationService (as in estimator): two identical calls hit the LLM twice."""
+    wrapper, router = _wrapper([json.dumps(VALID), json.dumps(VALID)])
     _call(wrapper)
-    result, meta = _call(wrapper)
+    _call(wrapper)
 
-    assert meta["cache_hit"] is True
-    assert result.total_cost_eur == 25000
-    assert len(router.calls) == 1
+    assert len(router.calls) == 2
+    assert wrapper.cache.store == {}

@@ -11,6 +11,7 @@ from openai import OpenAI
 from app.cache.semantic import EstimationSemanticCache, OpenAIEmbedder
 from app.config import get_settings
 from app.services.cache import EstimationCache
+from app.services.estimation import EstimationService
 from app.services.llm_wrapper import LLMWrapper
 
 log = structlog.get_logger()
@@ -78,3 +79,13 @@ def get_semantic_cache() -> EstimationSemanticCache | None:
             error=str(exc)[:200],
         )
         return None
+
+
+@lru_cache
+def get_estimation_service() -> EstimationService:
+    return EstimationService(
+        llm_wrapper=get_llm_wrapper(),
+        exact_cache=get_cache(),
+        semantic_cache=get_semantic_cache(),
+        openai_client=get_openai_client(),
+    )

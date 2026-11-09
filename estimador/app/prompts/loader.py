@@ -53,6 +53,15 @@ def _template_hash(version_dir: Path) -> str:
     return content_hash("\0".join(parts))
 
 
+def template_hash(version: str, use_case: str = "estimation") -> str:
+    """Public fingerprint of a template version, e.g. for cache keys.
+
+    Not memoised on purpose: ``uvicorn --reload`` only restarts on ``.py``
+    changes, so a cached hash would survive a ``.j2`` edit.
+    """
+    return _template_hash(_BASE_DIR / use_case / version)
+
+
 def render_estimation_prompt(
     request: EstimationRequest,
     version: str = "v1",

@@ -222,11 +222,3 @@ class EstimationResponse(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     attempts: int | None = Field(default=None, description="LLM calls needed to pass validation.")
-
-
-class StreamEstimationRequest(BaseModel):
-    """Streaming endpoint request — only the transcription, knobs are not exposed."""
-
-    transcription: str = Field(..., min_length=50, description="Meeting transcription text")
-    model: str | None = Field(default=None, description="Override the default model")
-    max_tokens: int = Field(default=4000, gt=0, le=16000)
