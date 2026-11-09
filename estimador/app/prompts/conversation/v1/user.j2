@@ -1,0 +1,9 @@
+<project_description>
+{{ description }}
+</project_description>
+
+Project type: {{ project_type }}.
+Estimate this project following the rules above, integrating the project_metadata context and the conversation history.
+{% if previous_estimate %}
+This turn updates an existing estimation: re-estimate the WHOLE project (everything in <current_estimate> plus what this message adds or changes), not only the new part.
+{% endif %}

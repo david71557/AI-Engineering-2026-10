@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.services.cache import EstimationCache
 from app.services.estimation import EstimationService
 from app.services.llm_wrapper import LLMWrapper
+from app.sessions.store import SessionStore
 
 log = structlog.get_logger()
 
@@ -82,10 +83,24 @@ def get_semantic_cache() -> EstimationSemanticCache | None:
 
 
 @lru_cache
+def get_session_store() -> SessionStore:
+    """In-memory store of conversational sessions. Singleton per worker.
+
+    State lives in process memory: docker compose restart clears it, and
+    workers > 1 each get their own copy. Documented limitation for the
+    Session 5 exercise; persistence is module-3 territory.
+    """
+    settings = get_settings()
+    return SessionStore(max_turns=settings.MAX_CONVERSATION_TURNS)
+
+
+@lru_cache
 def get_estimation_service() -> EstimationService:
+    settings = get_settings()
     return EstimationService(
         llm_wrapper=get_llm_wrapper(),
         exact_cache=get_cache(),
         semantic_cache=get_semantic_cache(),
         openai_client=get_openai_client(),
+        metadata_extractor_model=settings.METADATA_EXTRACTOR_MODEL,
     )

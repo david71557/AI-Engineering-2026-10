@@ -8,12 +8,19 @@ same UI works against a local uvicorn or against docker-compose.
 
 The service answers with a structured ``EstimationResponse``: a validated
 ``EstimationResult`` (phases, totals, confidence) plus call metadata (prompt
-version, cached, model, latency, LLM cost). Two tabs:
+version, cached, model, latency, LLM cost). Three tabs:
 
 - **New estimation**: the form and the result of the last call.
 - **Estimations**: every past estimation with duration, cost, confidence,
   prompt version, cached flag, model and latency. Kept in a local JSON file
   (``.estimations_history.json``) so it survives page reloads.
+- **Conversation** (Session 5): multi-turn estimation against ``/sessions``.
+  A session is created on page load (``POST /sessions``) and its
+  ``session_id`` kept in ``st.session_state``; each turn POSTs the transcript
+  plus optional PDF/DOCX attachments as ``multipart/form-data``. The sidebar
+  shows the service-side ``ProjectMetadata`` (the *memory*) next to the
+  history size (the *sliding window*), and "New conversation" calls
+  ``POST /sessions`` again and resets the state.
 """
 
 from __future__ import annotations
@@ -43,6 +50,8 @@ load_dotenv()
 
 API_BASE_URL = os.getenv("ESTIMATOR_API_BASE_URL", "http://localhost:8000")
 ESTIMATE_ENDPOINT = f"{API_BASE_URL.rstrip('/')}/api/v1/estimate"
+SESSIONS_ENDPOINT = f"{API_BASE_URL.rstrip('/')}/sessions"
+TRANSCRIPT_MIN, TRANSCRIPT_MAX = 20, 80_000  # mirrors the Form() bounds of POST /sessions/{id}/estimate
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
 HISTORY_FILE = Path(
     os.getenv("ESTIMATOR_HISTORY_FILE", Path(__file__).resolve().parent / ".estimations_history.json")
@@ -113,6 +122,51 @@ def _error_detail(response: httpx.Response) -> object:
         return response.json().get("detail", response.text)
     except ValueError:
         return response.text
+
+
+# --- Conversational sessions (Session 5) --------------------------------------
+
+
+def create_session() -> str:
+    """``POST /sessions`` → the new ``session_id`` (UUID v4)."""
+    response = httpx.post(SESSIONS_ENDPOINT, timeout=httpx.Timeout(10.0))
+    response.raise_for_status()
+    return response.json()["session_id"]
+
+
+def fetch_session(session_id: str) -> dict:
+    """``GET /sessions/{id}`` → ``{session_id, message_count, max_turns, metadata}``."""
+    response = httpx.get(f"{SESSIONS_ENDPOINT}/{session_id}", timeout=httpx.Timeout(10.0))
+    response.raise_for_status()
+    return response.json()
+
+
+def estimate_in_session(session_id: str, form: dict, uploads: list) -> EstimationResponse:
+    """``POST /sessions/{id}/estimate`` as ``multipart/form-data``: the form
+    fields plus one ``attachments`` part per uploaded file."""
+    files = [("attachments", (f.name, f.getvalue(), f.type or "application/octet-stream")) for f in uploads]
+    response = httpx.post(
+        f"{SESSIONS_ENDPOINT}/{session_id}/estimate",
+        data=form,
+        files=files or None,
+        timeout=httpx.Timeout(180.0, connect=10.0),
+    )
+    response.raise_for_status()
+    return EstimationResponse.model_validate(response.json())
+
+
+def start_new_conversation() -> None:
+    """Create a fresh server-side session and reset every piece of chat state."""
+    try:
+        st.session_state.session_id = create_session()
+        st.session_state.session_info = fetch_session(st.session_state.session_id)
+        st.session_state.session_error = None
+    except httpx.HTTPError as exc:
+        st.session_state.session_id = None
+        st.session_state.session_info = None
+        st.session_state.session_error = f"Could not create a session at `{SESSIONS_ENDPOINT}`: {exc}"
+    st.session_state.turns = []
+    st.session_state.conversation_form_key = st.session_state.get("conversation_form_key", 0) + 1
 
 
 # --- History persistence ----------------------------------------------------
@@ -226,8 +280,13 @@ if "history" not in st.session_state:
     st.session_state.history = load_history()
 if "last_entries" not in st.session_state:
     st.session_state.last_entries = []
+# Session 5: one conversational session per browser session, created on page load.
+if "session_id" not in st.session_state:
+    start_new_conversation()
 
-tab_new, tab_history = st.tabs(["New estimation", f"Estimations ({len(st.session_state.history)})"])
+tab_new, tab_history, tab_conversation = st.tabs(
+    ["New estimation", f"Estimations ({len(st.session_state.history)})", "Conversation"]
+)
 
 with tab_new:
     st.caption("Describe the project and choose how you want the estimation.")
@@ -370,6 +429,114 @@ with tab_history:
             st.rerun()
 
 
+with tab_conversation:
+    st.caption(
+        "Multi-turn estimation: refine the scope across turns and attach supporting "
+        "documents (PDF or Word). The service remembers the project between turns — "
+        "see the Project metadata panel in the sidebar."
+    )
+
+    if st.session_state.session_error:
+        st.error(st.session_state.session_error)
+
+    # Previous turns of this conversation (client-side mirror for display only;
+    # the service keeps its own sliding-window history).
+    for turn in st.session_state.turns:
+        with st.chat_message("user"):
+            st.markdown(turn["transcript"])
+            if turn["attachments"]:
+                st.caption("Attachments: " + ", ".join(f"`{name}`" for name in turn["attachments"]))
+        with st.chat_message("assistant"):
+            render_estimation(st, turn["entry"])
+
+    with st.form(f"conversation_form_{st.session_state.conversation_form_key}", clear_on_submit=False):
+        transcript = st.text_area(
+            "Transcript",
+            height=200,
+            max_chars=TRANSCRIPT_MAX,
+            placeholder=(
+                "Meeting transcript or message for this turn. On later turns you can just "
+                "add what changed: \"Now add Stripe billing on top.\""
+            ),
+            help=f"Between {TRANSCRIPT_MIN} and {TRANSCRIPT_MAX:,} characters.",
+        )
+        attachments = st.file_uploader(
+            "Attachments",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+            help="Supporting documentation. Its text is extracted by the service and added to the transcript.",
+        )
+        col_type, col_format = st.columns(2)
+        conv_project_type = col_type.selectbox(
+            "Project type",
+            options=list(ProjectType),
+            format_func=PROJECT_TYPE_LABELS.get,
+            index=list(ProjectType).index(ProjectType.WEB_SAAS),
+        )
+        conv_output_format = col_format.selectbox(
+            "Output format",
+            options=list(OutputFormat),
+            format_func=OUTPUT_FORMAT_LABELS.get,
+        )
+        conv_detail_level = st.radio(
+            "Detail level",
+            options=list(DetailLevel),
+            format_func=DETAIL_LEVEL_LABELS.get,
+            index=list(DetailLevel).index(DetailLevel.MEDIUM),
+            horizontal=True,
+        )
+        sent = st.form_submit_button(
+            "Send", type="primary", disabled=st.session_state.session_id is None
+        )
+
+    if sent:
+        if len(transcript.strip()) < TRANSCRIPT_MIN:
+            st.error(f"The transcript must be at least {TRANSCRIPT_MIN} characters long.")
+        else:
+            form = {
+                "transcript": transcript.strip(),
+                "project_type": conv_project_type.value,
+                "detail_level": conv_detail_level.value,
+                "output_format": conv_output_format.value,
+            }
+            with st.spinner("Calling the estimator service…"):
+                try:
+                    t0 = time.perf_counter()
+                    response = estimate_in_session(st.session_state.session_id, form, attachments or [])
+                    roundtrip_ms = int((time.perf_counter() - t0) * 1000)
+                except httpx.HTTPStatusError as exc:
+                    status, detail = exc.response.status_code, _error_detail(exc.response)
+                    if status == 404:
+                        st.warning(
+                            "This conversation no longer exists on the service (the API was "
+                            "restarted: sessions live in memory). Start a **New conversation**."
+                        )
+                    elif status == 400 and isinstance(detail, dict):
+                        label = GUARDRAIL_REASON_LABELS.get(detail.get("reason"), detail.get("reason"))
+                        st.warning(f"**Blocked by input guardrail — {label}.** {detail.get('message', '')}")
+                    elif status in (415, 422) and isinstance(detail, dict) and detail.get("filename"):
+                        st.error(f"Attachment `{detail['filename']}` rejected ({detail.get('reason')}). {detail.get('message', '')}")
+                    else:
+                        st.error(f"Service returned {status}: {detail}")
+                except (httpx.HTTPError, ValidationError) as exc:
+                    st.error(f"Could not reach the estimator at `{SESSIONS_ENDPOINT}`: {exc}")
+                else:
+                    st.session_state.turns.append(
+                        {
+                            "transcript": form["transcript"],
+                            "attachments": [f.name for f in attachments or []],
+                            "entry": {"response": response.model_dump(mode="json"), "roundtrip_ms": roundtrip_ms},
+                        }
+                    )
+                    try:
+                        st.session_state.session_info = fetch_session(st.session_state.session_id)
+                    except httpx.HTTPError:
+                        pass  # the panel keeps the previous snapshot
+                    # New form key = empty transcript and uploader for the next turn.
+                    st.session_state.conversation_form_key += 1
+                    st.rerun()
+
+
 with st.sidebar:
     st.header("Service")
     st.code(ESTIMATE_ENDPOINT, language="text")
@@ -381,3 +548,32 @@ with st.sidebar:
     if st.session_state.last_entries:
         with st.expander("Last request JSON"):
             st.json(st.session_state.last_entries[-1]["request"])
+
+    # Session 5: memory (ProjectMetadata) vs history (sliding window), side by side.
+    st.divider()
+    st.header("Conversation")
+    if st.session_state.session_id:
+        st.markdown("**Session id**")
+        st.code(st.session_state.session_id, language="text")
+    info = st.session_state.session_info
+    if info:
+        st.markdown(
+            f"**History:** {info['message_count']} messages "
+            f"({info['message_count'] // 2} of {info['max_turns']} turns in the window)"
+        )
+        st.subheader("Project metadata")
+        metadata = info["metadata"]
+        if not any(metadata.values()):
+            st.caption("Empty — first turn of the session. Filled in by the service after each answer.")
+        else:
+            st.markdown(f"**Project name:** {metadata.get('project_name') or '—'}")
+            st.markdown(f"**Assumed team size:** {metadata.get('assumed_team_size') or '—'}")
+            techs = metadata.get("mentioned_technologies") or []
+            st.markdown("**Technologies:** " + (", ".join(f"`{t}`" for t in techs) if techs else "—"))
+            st.markdown("**Agreed scope:**")
+            st.caption(metadata.get("agreed_scope") or "Not yet agreed.")
+        with st.expander("Raw metadata JSON"):
+            st.json(metadata)
+    if st.button("New conversation", width="stretch"):
+        start_new_conversation()
+        st.rerun()

@@ -38,6 +38,16 @@ class Settings(BaseSettings):
 
     ESTIMATOR_API_BASE_URL: str = "http://localhost:8000"
 
+    # --- Session 5 fields (conversational memory + attachments) ---
+    # MAX_CONVERSATION_TURNS counts user+assistant pairs. The system prompt is
+    # always preserved as an invariant on top of the window.
+    MAX_CONVERSATION_TURNS: int = 6
+    # Hard cap per extracted attachment (in characters) to protect the context
+    # window. Real chunking enters in module 3.
+    MAX_ATTACHMENT_CHARS: int = 60_000
+    # The metadata extractor runs once per turn; a small/cheap model is enough.
+    METADATA_EXTRACTOR_MODEL: str = "gpt-4o-mini"
+
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":
         """LiteLLM may try either provider via fallback, so we require at least one key."""

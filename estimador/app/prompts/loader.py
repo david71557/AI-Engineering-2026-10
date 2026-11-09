@@ -22,7 +22,14 @@ from pathlib import Path
 import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from app.schemas.estimation import EstimationRequest
+from app.schemas.estimation import (
+    DetailLevel,
+    EstimationRequest,
+    EstimationResult,
+    OutputFormat,
+    ProjectType,
+)
+from app.sessions.models import ProjectMetadata
 
 log = structlog.get_logger()
 
@@ -95,3 +102,81 @@ def render_estimation_prompt(
         reference_projects=len(context["reference_projects"]),
     )
     return system, user
+
+
+def render_conversational_prompt(
+    *,
+    description: str,
+    project_type: ProjectType,
+    detail_level: DetailLevel,
+    output_format: OutputFormat,
+    metadata: ProjectMetadata,
+    previous_estimate: EstimationResult | None = None,
+    version: str = "v1",
+) -> tuple[str, str]:
+    """Render the conversational system/user prompts (Session 5).
+
+    ``previous_estimate`` (the session's last validated estimation, None on
+    the first turn) is rendered as a ``<current_estimate>`` block so the model
+    re-estimates the whole project on top of it instead of only the new scope.
+
+    The system prompt includes a ``<project_metadata>`` block built from the
+    current ``ProjectMetadata``. The user prompt carries the enriched
+    transcript (raw transcript + any extracted attachment text).
+
+    Lives in ``conversation/<version>/`` (estimator_sesion5 calls it
+    ``estimation/v2``, but in estimador ``estimation/v2`` is the founder-tone
+    version of the one-shot prompt).
+    """
+    context = {
+        "description": description,
+        "project_type": project_type.value,
+        "detail_level": detail_level.value,
+        "output_format": output_format.value,
+        "metadata": metadata,
+        "metadata_is_empty": metadata.is_empty(),
+        "previous_estimate": previous_estimate,
+    }
+    system = _env.get_template(f"conversation/{version}/system.j2").render(**context)
+    user = _env.get_template(f"conversation/{version}/user.j2").render(**context)
+    _log_render("conversation", version, system, user)
+    return system, user
+
+
+def render_metadata_extraction_prompt(
+    *,
+    transcript: str,
+    result: EstimationResult,
+    previous: ProjectMetadata,
+    version: str = "v1",
+) -> tuple[str, str]:
+    """Render the prompts used by the metadata extractor (Session 5).
+
+    The extractor is a second LLM call per turn: it reads the latest user
+    transcript and assistant estimation, plus the metadata accumulated so far,
+    and returns a partial ``ProjectMetadata`` Pydantic object.
+    """
+    context = {
+        "transcript": transcript,
+        "result": result,
+        "phases": result.phases,
+        "previous": previous,
+        "previous_is_empty": previous.is_empty(),
+    }
+    system = _env.get_template(f"metadata_extraction/{version}/system.j2").render(**context)
+    user = _env.get_template(f"metadata_extraction/{version}/user.j2").render(**context)
+    _log_render("metadata_extraction", version, system, user)
+    return system, user
+
+
+def _log_render(use_case: str, version: str, system: str, user: str) -> None:
+    log.info(
+        "prompt_rendered",
+        use_case=use_case,
+        prompt_version=version,
+        template_hash=_template_hash(_BASE_DIR / use_case / version),
+        system_hash=content_hash(system),
+        user_hash=content_hash(user),
+        system_chars=len(system),
+        user_chars=len(user),
+    )

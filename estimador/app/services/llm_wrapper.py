@@ -209,6 +209,34 @@ class LLMWrapper:
         cost_usd, token usage and attempts. No caching here: as in estimator, the
         exact and semantic caches live in ``EstimationService``.
         """
+        return self.complete_structured_chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            response_model=response_model,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+        )
+
+    def complete_structured_chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        response_model: type[T],
+        model_override: str | None = None,
+        max_tokens: int = 4000,
+        max_retries: int = 3,
+    ) -> tuple[T, dict[str, Any]]:
+        """Conversational variant of :meth:`complete_structured` (Session 5).
+
+        Accepts a pre-built ``messages`` list (system + N user/assistant pairs +
+        current user). Same validation + re-prompt loop. Without
+        ``model_override`` it goes through the Router (primary first, fallback
+        on failure); with it, straight to that model (the metadata extractor
+        uses this to run on a cheap model). The caller's list is never mutated:
+        re-prompt turns are added to a private copy.
+        """
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -219,20 +247,22 @@ class LLMWrapper:
                 "strict": False,
             },
         }
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        messages = list(messages)
         usage = {"input_tokens": 0, "output_tokens": 0}
         cost_usd = 0.0
-        served_model = self.primary_model
+        served_model = model_override or self.primary_model
 
-        log.info("llm_structured_call_started", model=self.primary_model, response_model=response_model.__name__)
+        log.info(
+            "llm_structured_call_started",
+            model=served_model,
+            response_model=response_model.__name__,
+            messages=len(messages),
+        )
         t0 = time.perf_counter()
         for attempt in range(1, max_retries + 2):
             try:
-                response = self.router.completion(
-                    model="estimator",
+                response = self._dispatch(
+                    model_override=model_override,
                     messages=messages,
                     max_tokens=max_tokens,
                     response_format=response_format,

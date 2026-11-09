@@ -1,6 +1,6 @@
 # main.py
 from fastapi import FastAPI
-from app.routers import estimations
+from app.routers import estimations, sessions
 
 app = FastAPI(
     title="Estimador CAG",
@@ -9,6 +9,7 @@ app = FastAPI(
 )
 
 app.include_router(estimations.router)
+app.include_router(sessions.router)
 
 @app.get("/health")
 async def health():

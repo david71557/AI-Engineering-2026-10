@@ -43,10 +43,19 @@ from app.cache.semantic import EstimationSemanticCache
 from app.guardrails.input import check_input
 from app.guardrails.output import enforce_scope_response
 from app.prompts import render_estimation_prompt
-from app.prompts.loader import template_hash
-from app.schemas.estimation import EstimationRequest, EstimationResponse, EstimationResult
+from app.prompts.loader import render_conversational_prompt, template_hash
+from app.schemas.estimation import (
+    DetailLevel,
+    EstimationRequest,
+    EstimationResponse,
+    EstimationResult,
+    OutputFormat,
+    ProjectType,
+)
 from app.services.cache import EstimationCache
 from app.services.llm_wrapper import LLMWrapper
+from app.sessions.metadata_extractor import update_metadata
+from app.sessions.models import Session
 
 log = structlog.get_logger()
 
@@ -93,12 +102,16 @@ class EstimationService:
         semantic_cache: EstimationSemanticCache | None = None,
         openai_client: Any | None = None,
         prompt_version: str = "v1",
+        conversational_prompt_version: str = "v1",
+        metadata_extractor_model: str = "gpt-4o-mini",
     ) -> None:
         self.llm_wrapper = llm_wrapper
         self.exact_cache = exact_cache
         self.semantic_cache = semantic_cache
         self.openai_client = openai_client
         self.prompt_version = prompt_version
+        self.conversational_prompt_version = conversational_prompt_version
+        self.metadata_extractor_model = metadata_extractor_model
 
     def estimate(self, request: EstimationRequest, prompt_version: str | None = None) -> EstimationResponse:
         version = prompt_version or self.prompt_version
@@ -168,6 +181,97 @@ class EstimationService:
 
         # 8. Return.
         return _response(result, version, meta, cache_type=None)
+
+    def estimate_conversational(
+        self,
+        *,
+        session: Session,
+        transcript: str,
+        project_type: ProjectType,
+        detail_level: DetailLevel,
+        output_format: OutputFormat,
+    ) -> EstimationResponse:
+        """Multi-turn estimation pipeline (Session 5).
+
+        Differences with ``estimate``:
+        - No exact/semantic caching: every turn depends on the conversation
+          history + metadata, so two identical transcripts in different
+          sessions are NOT the same call. ``cached`` is always ``False``.
+        - The system prompt is the ``conversation`` template, which embeds the
+          current ``ProjectMetadata`` block. The LLM also receives the prior
+          user/assistant turns.
+        - After validation, the session's history is appended and a second
+          LLM call refreshes ``ProjectMetadata``.
+        """
+        # 1. Input guardrail on the enriched transcript (the caller has
+        #    already concatenated any extracted attachment text into it).
+        check_input(transcript, openai_client=self.openai_client)
+
+        # 2. Render the conversational system + user prompts (they include
+        #    the <project_metadata> block).
+        system_prompt, user_message = render_conversational_prompt(
+            description=transcript,
+            project_type=project_type,
+            detail_level=detail_level,
+            output_format=output_format,
+            metadata=session.metadata,
+            previous_estimate=session.last_estimate,
+            version=self.conversational_prompt_version,
+        )
+
+        # 3. Build the messages array: fresh system (just regenerated from the
+        #    current ProjectMetadata) + prior history (already bounded by the
+        #    sliding window) + current user.
+        messages = session.history.to_messages_list(
+            system_prompt=system_prompt, user_message=user_message
+        )
+
+        log.info(
+            "estimation_conversational_request",
+            session_id=session.session_id,
+            history_messages=len(session.history.messages),
+            metadata_is_empty=session.metadata.is_empty(),
+            transcript_chars=len(transcript),
+        )
+
+        # 4. LLM call: JSON + Pydantic validators, re-prompting on failure.
+        result, meta = self.llm_wrapper.complete_structured_chat(
+            messages=messages,
+            response_model=EstimationResult,
+        )
+        log.info(
+            "estimation_conversational_generated",
+            session_id=session.session_id,
+            confidence_pct=result.confidence_pct,
+            total_cost_eur=result.total_cost_eur,
+            phases=len(result.phases),
+            **meta,
+        )
+
+        # 5. Output guardrail (filter policy: normalises low-confidence answers).
+        result = enforce_scope_response(result)
+
+        # 6. Append the turn to the history (sliding window auto-trims) and keep
+        #    the result as the baseline the next turn must update.
+        session.history.append(user=user_message, assistant=result.model_dump_json())
+        session.last_estimate = result
+
+        # 7. Second-pass extractor refreshes ProjectMetadata. Failure is
+        #    swallowed inside update_metadata (returns previous unchanged).
+        session.metadata = update_metadata(
+            previous=session.metadata,
+            transcript=transcript,
+            result=result,
+            llm_wrapper=self.llm_wrapper,
+            model=self.metadata_extractor_model,
+        )
+
+        return _response(
+            result,
+            f"conversation/{self.conversational_prompt_version}",
+            meta,
+            cache_type=None,
+        )
 
     def _read_exact(self, cache_key: str) -> tuple[EstimationResult, dict] | None:
         cached = self.exact_cache.get(cache_key)
