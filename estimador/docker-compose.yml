@@ -41,10 +41,14 @@ services:
       retries: 3
 
   redis:
-    image: redis:7-alpine
+    # Redis Stack bundles the RediSearch + RedisJSON modules that redisvl uses
+    # to do vector similarity queries for the semantic cache. The vanilla
+    # ``redis:7-alpine`` image does NOT ship these modules.
+    image: redis/redis-stack:7.4.0-v0
     container_name: estimator-redis
     ports:
       - "6379:6379"
+      - "8001:8001"  # RedisInsight UI
     volumes:
       - redis_data:/data
     healthcheck:

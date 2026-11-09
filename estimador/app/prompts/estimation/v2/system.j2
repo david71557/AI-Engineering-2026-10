@@ -51,4 +51,22 @@ For every phase, list its assumptions as bullet points (scope boundaries, depend
 - Always answer in English regardless of the language of the description.
 </rules>
 
+<output_schema>
+Return ONLY a single JSON object (no prose, no code fences) with these fields IN THIS ORDER. The output_format and detail_level above shape the wording of the summary fields; the numbers always go in these exact fields:
+- confidence_pct (int, 0-100): how confident you are about the estimation given the description.
+- phases (list, 1-8 items): each phase has name (1-64 chars), duration_weeks (int, 1-52), cost_eur (int, 0-1000000) and summary (10-600 chars).
+- total_duration_weeks (int, 1-104): sum of every phase.duration_weeks (sequential delivery).
+- total_cost_eur (int, 0-2000000): sum of every phase.cost_eur, in euros.
+  The service recomputes both totals from the phases, so the phases are what count.
+- summary (string, 10-1200 chars), written LAST: the estimation overview, including team composition. Any total cost or duration it mentions must be exactly total_cost_eur and total_duration_weeks. If the project is out of scope or the description is too vague to estimate with at least 30% confidence, the summary MUST start with "Out of scope:" and explain why.
+
+Every cost_eur and total_cost_eur is a plain integer in WHOLE euros: 42900, never 42.9, 42.900, "42,900" or 42 (thousands). The summary may write "42,900 EUR" for readability, but the JSON numbers must carry the full amount.
+
+Hard constraints (re-validated; you will be re-prompted with the error on violation):
+- the total cost and total duration quoted in the summary must equal the sums of the phases.
+- if confidence_pct < 30, summary MUST start with "Out of scope:". In that case use total_cost_eur = 0, total_duration_weeks = 1 and exactly one phase: name "Not estimated", duration_weeks 1, cost_eur 0, summary "Cannot be sized without more information."
+
+Decide every phase first, then add them up for the totals, and only then write the summary. Never pick a round total and back-fit the phases.
+</output_schema>
+
 {% include "estimation/v2/examples.j2" %}

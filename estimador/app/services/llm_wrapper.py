@@ -20,15 +20,18 @@ Design notes
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar
 
 import litellm
 import structlog
 from litellm import Router
+from pydantic import BaseModel, ValidationError
 
 from app.services.cache import EstimationCache
 
 log = structlog.get_logger()
+
+T = TypeVar("T", bound=BaseModel)
 
 
 # Cost per 1M tokens (USD). Update as pricing changes.
@@ -43,7 +46,12 @@ MODEL_COSTS: dict[str, dict[str, float]] = {
 
 def _estimate_cost(model: str, tokens_in: int, tokens_out: int) -> float:
     base = _normalise_model_name(model)
-    costs = MODEL_COSTS.get(base) or MODEL_COSTS.get(model) or {"input": 0.0, "output": 0.0}
+    costs = MODEL_COSTS.get(base) or MODEL_COSTS.get(model)
+    if costs is None:
+        # Providers answer with dated snapshots ("gpt-4o-mini-2024-07-18"): use the
+        # longest known prefix so "gpt-4o-mini-..." doesn't fall back to "gpt-4o".
+        prefixes = [name for name in MODEL_COSTS if base.startswith(name)]
+        costs = MODEL_COSTS[max(prefixes, key=len)] if prefixes else {"input": 0.0, "output": 0.0}
     return round((tokens_in * costs["input"] + tokens_out * costs["output"]) / 1_000_000, 6)
 
 
@@ -182,6 +190,151 @@ class LLMWrapper:
         )
         self.cache.set(cache_key, result)
         return {**result, "cache_hit": False}
+
+    def complete_structured(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        response_model: type[T],
+        max_tokens: int = 4000,
+        max_retries: int = 3,
+    ) -> tuple[T, dict[str, Any]]:
+        """Ask for JSON matching ``response_model`` and validate it with Pydantic.
+
+        Same contract as Instructor (which can't be installed next to openai>=3):
+        when validation fails, the error is fed back to the model as a new user
+        turn and it gets another try, up to ``max_retries`` extra attempts. Goes
+        through the Router, so the fallback model still applies.
+
+        Returns ``(instance, meta)``; ``meta`` holds model, provider, latency_ms,
+        cost_usd, token usage, attempts and cache_hit. Only validated results are
+        cached.
+        """
+        cache_key = self._structured_cache_key(system_prompt, user_message, response_model, max_tokens)
+        cached = self._read_structured(cache_key, response_model)
+        if cached:
+            return cached
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_model.__name__,
+                "schema": response_model.model_json_schema(),
+                # Non-strict: Field bounds (minLength, maximum...) stay in the schema
+                # as guidance; Pydantic enforces them, plus the model validators.
+                "strict": False,
+            },
+        }
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        cost_usd = 0.0
+        served_model = self.primary_model
+
+        log.info("llm_structured_call_started", model=self.primary_model, response_model=response_model.__name__)
+        t0 = time.perf_counter()
+        for attempt in range(1, max_retries + 2):
+            try:
+                response = self.router.completion(
+                    model="estimator",
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                )
+            except Exception as exc:
+                log.error(
+                    "llm_structured_call_failed",
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:400],
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                    attempt=attempt,
+                )
+                raise
+
+            normalised = self._normalise_response(response, latency_ms=0)
+            served_model = normalised["model"]
+            usage["input_tokens"] += normalised["usage"]["input_tokens"]
+            usage["output_tokens"] += normalised["usage"]["output_tokens"]
+            cost_usd += normalised["cost_usd"]
+            content = normalised["estimation"]
+
+            try:
+                result = response_model.model_validate_json(_strip_code_fences(content))
+                break
+            except ValidationError as exc:
+                log.warning(
+                    "llm_structured_validation_failed",
+                    attempt=attempt,
+                    errors=exc.error_count(),
+                    first_error=exc.errors()[0]["msg"][:200],
+                )
+                if attempt > max_retries:
+                    raise
+                messages += [
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your JSON failed validation. Fix every error below and return "
+                            f"ONLY the corrected JSON object:\n{exc}"
+                        ),
+                    },
+                ]
+
+        meta = {
+            "model": served_model,
+            "provider": _provider_from_model(served_model),
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "cost_usd": round(cost_usd, 6),
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "attempts": attempt,
+        }
+        log.info("llm_structured_call_completed", **meta)
+        self.cache.set(cache_key, {"result": result.model_dump(mode="json"), "meta": meta})
+        return result, {**meta, "cache_hit": False}
+
+    def lookup_structured(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        response_model: type[T],
+        max_tokens: int = 4000,
+    ) -> tuple[T, dict[str, Any]] | None:
+        """Exact-match cache lookup only (no LLM call), same key as ``complete_structured``.
+
+        Lets the caller put other layers (the semantic cache) between the cheap
+        exact lookup and the expensive LLM call.
+        """
+        cache_key = self._structured_cache_key(system_prompt, user_message, response_model, max_tokens)
+        return self._read_structured(cache_key, response_model)
+
+    def _structured_cache_key(
+        self, system_prompt: str, user_message: str, response_model: type[BaseModel], max_tokens: int
+    ) -> str:
+        return EstimationCache.make_key(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            model=f"{self.primary_model}|structured:{response_model.__name__}",
+            max_tokens=max_tokens,
+            thinking_budget=None,
+        )
+
+    def _read_structured(self, cache_key: str, response_model: type[T]) -> tuple[T, dict[str, Any]] | None:
+        cached = self.cache.get(cache_key)
+        if not cached:
+            return None
+        try:
+            result = response_model.model_validate(cached["result"])
+        except (KeyError, ValidationError) as exc:
+            # Entry written under an older schema/validator: treat as a miss.
+            log.warning("structured_cache_entry_invalid", error=str(exc)[:200])
+            return None
+        return result, {**cached["meta"], "cache_hit": True}
 
     def complete_stream(
         self,
@@ -368,6 +521,15 @@ class LLMWrapper:
             "latency_ms": latency_ms,
             "cost_usd": _estimate_cost(model, input_tokens, output_tokens),
         }
+
+
+def _strip_code_fences(text: str) -> str:
+    """Some providers wrap JSON in ```json fences even when asked not to."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    return text.strip()
 
 
 def _extract_delta(chunk: Any) -> str:

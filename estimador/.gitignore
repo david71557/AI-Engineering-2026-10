@@ -10,3 +10,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Historial local de estimaciones del cliente Streamlit
+.estimations_history.json

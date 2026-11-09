@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     CACHE_TTL: int = 86400
 
+    # --- Session 4 fields (semantic cache, needs Redis Stack) ---
+    SEMANTIC_CACHE_ENABLED: bool = True
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    SEMANTIC_CACHE_THRESHOLD: float = 0.85
+    SEMANTIC_CACHE_TTL: int = 86400
+    # When True, the semantic cache LOGS potential hits but does NOT serve them.
+    # Used to gather metrics before flipping the cache on in production.
+    SEMANTIC_CACHE_LOG_ONLY: bool = False
+
     ESTIMATOR_API_BASE_URL: str = "http://localhost:8000"
 
     @model_validator(mode="after")
