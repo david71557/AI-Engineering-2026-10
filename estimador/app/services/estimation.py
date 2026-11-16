@@ -53,6 +53,7 @@ from app.schemas.estimation import (
     EstimationResult,
     OutputFormat,
     ProjectType,
+    TurnObservation,
 )
 from app.services.boss import Boss
 from app.services.cache import EstimationCache
@@ -205,6 +206,7 @@ class EstimationService:
         detail_level: DetailLevel,
         output_format: OutputFormat,
         tier: Tier | None = None,
+        attachments_total_chars: int = 0,
     ) -> EstimationResponse:
         """Multi-turn estimation pipeline (Session 5).
 
@@ -228,6 +230,7 @@ class EstimationService:
             5. Output guardrail
             6. Append + compress + keep the baseline
             7. Metadata extractor
+            8. Emit the unified ``turn_observed`` event
         """
         resolved_tier, rule = self._prepare_turn(session=session, transcript=transcript, tier=tier)
 
@@ -266,7 +269,30 @@ class EstimationService:
         )
         result = enforce_scope_response(result)
 
-        self._commit_turn(session=session, transcript=transcript, user_message=user_message, result=result)
+        turn_index = self._commit_turn(
+            session=session, transcript=transcript, user_message=user_message, result=result
+        )
+
+        # 8. Unified per-turn observation: ONE structured event instead of
+        #    reconciling several log lines. Window/anchors/summary are read
+        #    AFTER compression (the state the next turn will see). The
+        #    conversational path bypasses both caches, hence "none".
+        observation = TurnObservation(
+            turn_index=max(1, turn_index),
+            session_id=session.session_id,
+            enriched_transcript_chars=len(transcript),
+            attachments_total_chars=attachments_total_chars,
+            messages_in_window=len(session.history.messages),
+            anchors_count=len(session.history.anchors),
+            summary_chars=len(session.history.summary or ""),
+            tokens_in=int(meta.get("tokens_in", 0) or 0),
+            tokens_out=int(meta.get("tokens_out", 0) or 0),
+            cost_usd=float(meta.get("cost_usd", 0.0) or 0.0),
+            latency_ms=int(meta.get("latency_ms", 0) or 0),
+            cache_hit_kind="none",
+            last_resolved_tier=session.last_resolved_tier,
+        )
+        log.info("turn_observed", **observation.model_dump())
 
         response = _response(result, f"conversation/{self.conversational_prompt_version}", meta, cache_type=None)
         return response.model_copy(update={"tier": resolved_tier.value, "tier_rule": rule})
@@ -393,8 +419,12 @@ class EstimationService:
             critic_feedback=critic_feedback,
         )
 
-    def _commit_turn(self, *, session: Session, transcript: str, user_message: str, result: EstimationResult) -> None:
-        """Persist one validated turn.
+    def _commit_turn(self, *, session: Session, transcript: str, user_message: str, result: EstimationResult) -> int:
+        """Persist one validated turn and return its ``turn_index``.
+
+        ``turn_index`` is captured right after the append and BEFORE
+        compression (same as estimator): compression evicts pairs out of the
+        window, so measured afterwards it would under-count.
 
         1. Append without trimming, then let ``CompressionPolicy`` evict the
            overflow: anchor pairs are promoted verbatim, the rest are folded
@@ -405,6 +435,7 @@ class EstimationService:
            swallowed inside ``update_metadata``).
         """
         session.history.append(user=user_message, assistant=result.model_dump_json(), trim=False)
+        turn_index = len(session.history.messages) // 2
         apply_compression(
             session.history,
             llm_wrapper=self.llm_wrapper,
@@ -419,6 +450,7 @@ class EstimationService:
             llm_wrapper=self.llm_wrapper,
             model=self.metadata_extractor_model,
         )
+        return turn_index
 
     def _read_exact(self, cache_key: str) -> tuple[EstimationResult, dict] | None:
         cached = self.exact_cache.get(cache_key)

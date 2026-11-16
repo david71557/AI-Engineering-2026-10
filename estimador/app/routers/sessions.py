@@ -118,7 +118,7 @@ async def estimate_in_session(
     service: EstimationService = Depends(get_estimation_service),
 ) -> EstimationResponse:
     session = _get_session_or_404(store, session_id)
-    enriched = await _enrich_transcript(session_id, transcript, attachments)
+    enriched, attachments_total_chars = await _enrich_transcript(session_id, transcript, attachments)
     return await _run_pipeline(
         service.estimate_conversational,
         session=session,
@@ -127,6 +127,7 @@ async def estimate_in_session(
         detail_level=detail_level,
         output_format=output_format,
         tier=tier,
+        attachments_total_chars=attachments_total_chars,
     )
 
 
@@ -149,7 +150,7 @@ async def estimate_in_session_acb(
     show the audit trail in their UI.
     """
     session = _get_session_or_404(store, session_id)
-    enriched = await _enrich_transcript(session_id, transcript, attachments)
+    enriched, _attachments_total_chars = await _enrich_transcript(session_id, transcript, attachments)
     return await _run_pipeline(
         service.estimate_with_acb,
         session=session,
@@ -171,8 +172,16 @@ def _get_session_or_404(store: SessionStore, session_id: str) -> Session:
         raise HTTPException(status_code=404, detail="session_not_found") from exc
 
 
-async def _enrich_transcript(session_id: str, transcript: str, attachments: list[UploadFile]) -> str:
-    """Extract each attachment's text and append it to the transcript."""
+async def _enrich_transcript(
+    session_id: str, transcript: str, attachments: list[UploadFile]
+) -> tuple[str, int]:
+    """Extract each attachment's text and append it to the transcript.
+
+    Returns ``(enriched_transcript, attachments_total_chars)``. The second
+    element is the raw extracted text length summed over all attachments
+    (without the ``--- attachment: ... ---`` fences); it feeds the
+    ``attachments_total_chars`` field of the ``turn_observed`` event.
+    """
     settings = get_settings()
     extracted: list[tuple[str, str]] = []
     for upload in attachments or []:
@@ -203,14 +212,16 @@ async def _enrich_transcript(session_id: str, transcript: str, attachments: list
             extracted.append((upload.filename, text))
 
     enriched = enrich_transcript(transcript=transcript, attachments=extracted)
+    attachments_total_chars = sum(len(text) for _, text in extracted)
     log.info(
         "session_estimate_received",
         session_id=session_id,
         transcript_chars=len(transcript),
         enriched_transcript_chars=len(enriched),
         attachment_count=len(extracted),
+        attachments_total_chars=attachments_total_chars,
     )
-    return enriched
+    return enriched, attachments_total_chars
 
 
 async def _run_pipeline(pipeline, **kwargs):
