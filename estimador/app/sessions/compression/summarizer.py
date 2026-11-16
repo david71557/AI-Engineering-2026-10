@@ -69,7 +69,6 @@ class CumulativeSummarizer:
             evicted_count=len(evicted),
             previous_chars=len(previous_summary or ""),
             new_chars=len(summary),
-            model=meta.get("model"),
-            latency_ms=meta.get("latency_ms"),
+            **meta,
         )
         return summary

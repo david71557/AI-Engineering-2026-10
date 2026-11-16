@@ -64,8 +64,7 @@ def update_metadata(
     merged = previous.merge_with(extracted)
     log.info(
         "metadata_extraction_completed",
-        model=meta["model"],
-        latency_ms=meta["latency_ms"],
+        **meta,
         project_name=merged.project_name,
         team_size=merged.assumed_team_size,
         tech_count=len(merged.mentioned_technologies),

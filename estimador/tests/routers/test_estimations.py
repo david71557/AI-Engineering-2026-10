@@ -45,8 +45,8 @@ META = {
     "provider": "openai",
     "latency_ms": 1234,
     "cost_usd": 0.0012,
-    "input_tokens": 1500,
-    "output_tokens": 400,
+    "tokens_in": 1500,
+    "tokens_out": 400,
     "attempts": 1,
 }
 
@@ -160,6 +160,19 @@ def test_response_carries_structured_result_and_metadata(client: TestClient) -> 
     assert body["model"] == "gpt-4o-mini"
     assert body["latency_ms"] == 1234
     assert body["cost_usd"] == 0.0012
+    assert (body["input_tokens"], body["output_tokens"]) == (1500, 400)  # meta tokens_in/out
+
+
+def test_exact_cache_entry_from_before_the_tokens_rename_still_reports_tokens(
+    client: TestClient, service: EstimationService
+) -> None:
+    client.post("/api/v1/estimate", json=PAYLOAD)
+    (key, entry), = service.exact_cache.store.items()
+    entry["meta"] = {"model": "gpt-4o-mini", "input_tokens": 900, "output_tokens": 100}  # legacy shape
+
+    body = client.post("/api/v1/estimate", json=PAYLOAD).json()
+    assert body["cache_type"] == "exact"
+    assert (body["input_tokens"], body["output_tokens"]) == (900, 100)
 
 
 def test_system_prompt_asks_for_json_schema(client: TestClient, fake_wrapper: FakeWrapper) -> None:

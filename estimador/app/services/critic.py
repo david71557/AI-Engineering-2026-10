@@ -66,7 +66,6 @@ class Critic:
             verdict=feedback.verdict,
             issue_count=len(feedback.issues),
             confidence=feedback.confidence_in_review,
-            model=meta.get("model"),
-            latency_ms=meta.get("latency_ms"),
+            **meta,
         )
         return feedback

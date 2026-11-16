@@ -5,6 +5,7 @@ Servicio FastAPI que genera estimaciones de proyectos software con un LLM, y un 
 - **Contrato tipado**: `EstimationRequest` (`description`, `project_type`, `detail_level`, `output_format` y, opcional, `reference_projects`) → `EstimationResponse` (`result` estructurado y validado con Pydantic, `prompt_version`, `cached` y metadatos de la llamada).
 - **Prompts versionados** con Jinja2 en `app/prompts/<caso de uso>/<versión>/`.
 - **Wrapper LiteLLM**: primero OpenAI (`PRIMARY_MODEL`) y, si falla, Claude (`FALLBACK_MODEL`). Logs estructurados con structlog.
+- **Wrapper observable**: cada llamada al LLM (estimación, extractor, resumen, anclas, crítico) devuelve y registra `model`, `provider`, `latency_ms`, `tokens_in`, `tokens_out` y `cost_usd` (más `attempts` en las estructuradas, con tokens y coste sumados entre reintentos). El coste sale de la tabla `MODEL_COSTS` de `app/services/llm_wrapper.py` (USD por millón de tokens). Un modelo que no está en la tabla cuesta 0 y deja un aviso `model_cost_unknown`. Si se agotan los reintentos, `llm_structured_call_exhausted` registra lo gastado.
 - **Guardrails** de entrada (moderación, inyección de prompt, datos personales) y de salida (respuestas de baja confianza).
 - **Cachés** exacta y semántica en Redis Stack (solo en el endpoint transaccional).
 - **Sesiones conversacionales** (Sesión 5): memoria multi-turno y adjuntos PDF/Word en `/sessions`. Ver [más abajo](#sesión-5--memoria-conversacional-y-adjuntos).
@@ -108,6 +109,29 @@ No llaman al LLM ni necesitan Docker ni Redis (el LLM, las cachés y la moderaci
 - **Wrapper, esquema, cachés y guardrails** (`tests/test_llm_wrapper_structured.py`, `tests/test_cache_semantic.py`, `tests/test_guardrails_*.py`).
 - **Sesiones** (`tests/test_sessions_*.py`, `tests/test_metadata_extractor.py`, `tests/routers/test_sessions.py`).
 - **Compresión, tier y ACB** (`tests/test_compression.py`, `tests/test_tier_resolver.py`, `tests/test_acb.py`, `tests/test_sessions_live.py`).
+- **Framework de evals** (`tests/test_evals.py`): dataset, las tres métricas y el runner en ambos modos con el LLM simulado.
+
+## Evals (golden dataset)
+
+A diferencia de los tests, los evals **llaman al LLM real** para medir la calidad de las estimaciones. Viven en `evals/`:
+
+- `golden_dataset.json`: 16 casos con los cuatro tipos de proyecto, alcances pequeños y grandes, NDA/HIPAA/GDPR/PCI (tier `executive`), equipo de dos (`pm`), infraestructura (`developer`), deadline ajustado y dos fuera de alcance (uno vago y uno adversarial). Cada caso fija rangos, no cifras exactas: número de fases, coste en EUR, semanas, términos que deben aparecer y tier esperado.
+- `metrics.py`: tres métricas binarias y deterministas (puntuación 1.0 o 0.0, y `details` explica el fallo):
+  | Métrica | Comprueba |
+  |---|---|
+  | `SchemaAdherenceMetric` | las fases suman los totales, baja confianza ⇒ `Out of scope:`, nº de fases dentro del rango |
+  | `CostBoundsMetric` | coste y semanas dentro del rango; los casos fuera de alcance exigen el sobre 0 EUR / 1 semana |
+  | `ContentRecallMetric` | aparecen todos los `expected_in_summary` y al menos una tecnología esperada (se omite en fuera de alcance) |
+- `run.py`: el runner CLI. Cada caso se lanza en una sesión nueva. Un rechazo del guardrail de entrada cuenta como "fuera de alcance" si el caso lo esperaba. El tier se compara con el esperado y se informa aparte, sin contar como métrica.
+
+```bash
+uv run python -m evals.run --mode actor                              # /sessions/{id}/estimate
+uv run python -m evals.run --mode acb --output reports/acb.json      # /sessions/{id}/estimate-acb
+uv run python -m evals.run --mode actor --case case-008-hipaa-executive --limit 3
+uv run python -m evals.run --mode actor --http http://localhost:8000 # contra la API en Docker
+```
+
+Por defecto usa la app en proceso (`TestClient`) con tu `.env`, sin levantar servidor. Coste aproximado con `gpt-4o-mini`: 2 llamadas por caso en `actor` y hasta `2 × BOSS_MAX_ITERATIONS + 1` en `acb`. Con `--output` se guarda el informe en JSON (métricas por caso, tier, coste, decisión del Boss) para comparar `actor` frente a `acb` o un cambio de prompt. El proceso termina con código 0 solo si todos los casos pasan las tres métricas.
 
 Los **tests del Paso 7** son de integración con `httpx.AsyncClient` sobre la app ASGI, con todo real salvo el LLM:
 

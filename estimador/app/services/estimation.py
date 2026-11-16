@@ -450,7 +450,9 @@ def _response(
         provider=meta.get("provider"),
         latency_ms=meta.get("latency_ms"),
         cost_usd=meta.get("cost_usd"),
-        input_tokens=meta.get("input_tokens"),
-        output_tokens=meta.get("output_tokens"),
+        # Wrapper meta says tokens_in/out; exact-cache entries written before the
+        # rename still carry input_tokens/output_tokens.
+        input_tokens=meta.get("tokens_in", meta.get("input_tokens")),
+        output_tokens=meta.get("tokens_out", meta.get("output_tokens")),
         attempts=meta.get("attempts"),
     )

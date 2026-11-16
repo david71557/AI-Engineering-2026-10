@@ -114,7 +114,7 @@ class AnchorDetector:
             'Return ONLY a JSON object: {"is_anchor": bool, "reason": string}.'
         )
         try:
-            classification, _meta = self.llm_wrapper.complete_structured_chat(
+            classification, meta = self.llm_wrapper.complete_structured_chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"User turn:\n{message.content}"},
@@ -127,7 +127,13 @@ class AnchorDetector:
         except Exception as exc:  # noqa: BLE001
             log.warning("anchor_llm_failed_fallback_heuristic", error_type=type(exc).__name__, error=str(exc)[:200])
             return self._detect_heuristic(message)
+        log.info(
+            "anchor_classified",
+            strategy="llm",
+            is_anchor=classification.is_anchor,
+            reason=classification.reason[:120],
+            **meta,
+        )
         if classification.is_anchor:
-            log.info("anchor_detected", strategy="llm", reason=classification.reason[:120])
             return AnchorMatch(is_anchor=True, matched_rules=[f"llm:{classification.reason[:60]}"])
         return AnchorMatch(is_anchor=False)

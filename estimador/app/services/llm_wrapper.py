@@ -13,6 +13,20 @@ Design notes
   only use the fallback when it fails, instead of load-balancing between them.
   When the caller overrides the model per-request, we bypass the Router and
   call ``litellm.completion`` directly — that path has no fallback by design.
+
+Observability contract
+----------------------
+Every call returns (and logs) the same six fields, whichever service made it
+(estimation, metadata extractor, summarizer, anchor classifier, critic):
+
+    model, provider, latency_ms, tokens_in, tokens_out, cost_usd
+
+``complete_structured*`` add ``attempts`` (LLM calls needed to pass
+validation); tokens and cost are summed over all attempts. ``cost_usd`` comes
+from ``MODEL_COSTS`` (USD per 1M tokens); a model missing from the table
+costs 0 and logs ``model_cost_unknown`` so the gap is visible. When the
+re-prompt loop gives up, ``llm_structured_call_exhausted`` still logs the
+tokens and cost spent before the ``ValidationError`` is raised.
 """
 
 from __future__ import annotations
@@ -49,8 +63,28 @@ def _estimate_cost(model: str, tokens_in: int, tokens_out: int) -> float:
         # Providers answer with dated snapshots ("gpt-4o-mini-2024-07-18"): use the
         # longest known prefix so "gpt-4o-mini-..." doesn't fall back to "gpt-4o".
         prefixes = [name for name in MODEL_COSTS if base.startswith(name)]
-        costs = MODEL_COSTS[max(prefixes, key=len)] if prefixes else {"input": 0.0, "output": 0.0}
+        if prefixes:
+            costs = MODEL_COSTS[max(prefixes, key=len)]
+        else:
+            log.warning("model_cost_unknown", model=model, tokens_in=tokens_in, tokens_out=tokens_out)
+            costs = {"input": 0.0, "output": 0.0}
     return round((tokens_in * costs["input"] + tokens_out * costs["output"]) / 1_000_000, 6)
+
+
+def call_meta(
+    *, model: str, latency_ms: int, tokens_in: int, tokens_out: int, cost_usd: float, **extra: Any
+) -> dict[str, Any]:
+    """The per-call observability record (see the module docstring)."""
+    model = _normalise_model_name(model)
+    return {
+        "model": model,
+        "provider": _provider_from_model(model),
+        "latency_ms": latency_ms,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_usd": round(cost_usd, 6),
+        **extra,
+    }
 
 
 def _normalise_model_name(model: str) -> str:
@@ -180,8 +214,8 @@ class LLMWrapper:
             "llm_call_completed",
             model=result["model"],
             provider=result["provider"],
-            input_tokens=result["usage"]["input_tokens"],
-            output_tokens=result["usage"]["output_tokens"],
+            tokens_in=result["tokens_in"],
+            tokens_out=result["tokens_out"],
             cost_usd=result["cost_usd"],
             latency_ms=latency_ms,
             finish_reason=result["finish_reason"],
@@ -248,7 +282,7 @@ class LLMWrapper:
             },
         }
         messages = list(messages)
-        usage = {"input_tokens": 0, "output_tokens": 0}
+        tokens_in = tokens_out = 0
         cost_usd = 0.0
         served_model = model_override or self.primary_model
 
@@ -272,15 +306,22 @@ class LLMWrapper:
                     "llm_structured_call_failed",
                     error_type=type(exc).__name__,
                     error=str(exc)[:400],
-                    latency_ms=int((time.perf_counter() - t0) * 1000),
                     attempt=attempt,
+                    # What earlier attempts already cost before the transport failed.
+                    **call_meta(
+                        model=served_model,
+                        latency_ms=int((time.perf_counter() - t0) * 1000),
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        cost_usd=cost_usd,
+                    ),
                 )
                 raise
 
             normalised = self._normalise_response(response, latency_ms=0)
             served_model = normalised["model"]
-            usage["input_tokens"] += normalised["usage"]["input_tokens"]
-            usage["output_tokens"] += normalised["usage"]["output_tokens"]
+            tokens_in += normalised["tokens_in"]
+            tokens_out += normalised["tokens_out"]
             cost_usd += normalised["cost_usd"]
             content = normalised["estimation"]
 
@@ -295,6 +336,18 @@ class LLMWrapper:
                     first_error=exc.errors()[0]["msg"][:200],
                 )
                 if attempt > max_retries:
+                    log.error(
+                        "llm_structured_call_exhausted",
+                        response_model=response_model.__name__,
+                        **call_meta(
+                            model=served_model,
+                            latency_ms=int((time.perf_counter() - t0) * 1000),
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            cost_usd=cost_usd,
+                            attempts=attempt,
+                        ),
+                    )
                     raise
                 messages += [
                     {"role": "assistant", "content": content},
@@ -307,16 +360,15 @@ class LLMWrapper:
                     },
                 ]
 
-        meta = {
-            "model": served_model,
-            "provider": _provider_from_model(served_model),
-            "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "cost_usd": round(cost_usd, 6),
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"],
-            "attempts": attempt,
-        }
-        log.info("llm_structured_call_completed", **meta)
+        meta = call_meta(
+            model=served_model,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            attempts=attempt,
+        )
+        log.info("llm_structured_call_completed", response_model=response_model.__name__, **meta)
         return result, meta
 
     # ------------------------------------------------------------------
@@ -380,16 +432,20 @@ class LLMWrapper:
         model = _normalise_model_name(response.model)
         return {
             "estimation": choice.message.content or "",
-            "model": model,
-            "provider": _provider_from_model(model),
             "finish_reason": finish_reason,
+            # Legacy nested shape kept for complete() callers.
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
             },
-            "latency_ms": latency_ms,
-            "cost_usd": _estimate_cost(model, input_tokens, output_tokens),
+            **call_meta(
+                model=model,
+                latency_ms=latency_ms,
+                tokens_in=input_tokens,
+                tokens_out=output_tokens,
+                cost_usd=_estimate_cost(model, input_tokens, output_tokens),
+            ),
         }
 
 

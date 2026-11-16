@@ -117,7 +117,8 @@ def test_validator_error_is_fed_back_and_retried() -> None:
 
     assert result.total_cost_eur == 25000
     assert meta["attempts"] == 2
-    assert meta["input_tokens"] == 2000  # usage accumulates across attempts
+    assert (meta["tokens_in"], meta["tokens_out"]) == (2000, 400)  # usage accumulates across attempts
+    assert meta["cost_usd"] == pytest.approx(2 * (1000 * 0.15 + 200 * 0.60) / 1_000_000)
     retry_prompt = router.calls[1][-1]["content"]
     assert "the summary states 30,000 EUR but the phases add up to 25,000 EUR" in retry_prompt
 
@@ -188,6 +189,73 @@ def test_gives_up_after_max_retries() -> None:
     with pytest.raises(ValidationError):
         _call(wrapper, max_retries=2)
     assert len(router.calls) == 3
+
+
+# --- Observability contract ------------------------------------------------------
+
+OBSERVABLE_FIELDS = {"model", "provider", "latency_ms", "tokens_in", "tokens_out", "cost_usd"}
+
+
+def test_structured_meta_exposes_the_observability_contract() -> None:
+    wrapper, _ = _wrapper([json.dumps(VALID)])
+    _, meta = _call(wrapper)
+
+    assert OBSERVABLE_FIELDS <= set(meta)
+    assert meta["model"] == "gpt-4o-mini"
+    assert meta["provider"] == "openai"
+    assert isinstance(meta["latency_ms"], int) and meta["latency_ms"] >= 0
+    assert (meta["tokens_in"], meta["tokens_out"]) == (1000, 200)
+    # MODEL_COSTS["gpt-4o-mini"] = 0.15 in / 0.60 out per 1M tokens.
+    assert meta["cost_usd"] == pytest.approx((1000 * 0.15 + 200 * 0.60) / 1_000_000)
+    assert meta["attempts"] == 1
+
+
+def test_complete_returns_the_same_contract() -> None:
+    wrapper, _ = _wrapper(["free text answer"])
+    result = wrapper.complete(system_prompt="sys", user_message="user")
+
+    assert OBSERVABLE_FIELDS <= set(result)
+    assert (result["tokens_in"], result["tokens_out"]) == (1000, 200)
+    assert result["usage"]["input_tokens"] == 1000  # legacy nested shape still there
+    assert result["cache_hit"] is False
+
+
+def test_fallback_model_is_reported_with_its_own_provider_and_price() -> None:
+    wrapper, router = _wrapper([json.dumps(VALID)])
+    original = router.completion
+
+    def served_by_fallback(**kwargs):
+        response = original(**kwargs)
+        response.model = "anthropic/claude-haiku-4-5-20251001"
+        return response
+
+    router.completion = served_by_fallback
+    _, meta = _call(wrapper)
+
+    assert (meta["model"], meta["provider"]) == ("claude-haiku-4-5-20251001", "anthropic")
+    assert meta["cost_usd"] == pytest.approx((1000 * 1.00 + 200 * 5.00) / 1_000_000)
+
+
+def test_unknown_model_costs_zero_and_is_logged() -> None:
+    from structlog.testing import capture_logs
+
+    from app.services.llm_wrapper import _estimate_cost
+
+    with capture_logs() as logs:
+        assert _estimate_cost("mystery-model-9", 1000, 100) == 0.0
+    assert any(e["event"] == "model_cost_unknown" and e["model"] == "mystery-model-9" for e in logs)
+
+
+def test_exhausted_retries_still_log_what_was_spent() -> None:
+    from structlog.testing import capture_logs
+
+    wrapper, _ = _wrapper([json.dumps(WRONG_SUMMARY)] * 2)
+    with capture_logs() as logs, pytest.raises(ValidationError):
+        _call(wrapper, max_retries=1)
+
+    exhausted = next(e for e in logs if e["event"] == "llm_structured_call_exhausted")
+    assert (exhausted["tokens_in"], exhausted["tokens_out"], exhausted["attempts"]) == (2000, 400, 2)
+    assert exhausted["cost_usd"] > 0
 
 
 def test_structured_calls_are_never_cached_by_the_wrapper() -> None:
