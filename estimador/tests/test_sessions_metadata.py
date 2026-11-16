@@ -136,7 +136,9 @@ def test_two_turns_accumulate_metadata(
     r1 = client.post(f"/sessions/{session_id}/estimate", data=VALID_FORM)
     assert r1.status_code == 200, r1.text
     body = r1.json()
-    assert body["prompt_version"] == "conversation/v1"
+    assert body["prompt_version"] == "conversation/v2"
+    assert body["tier"] == "default"
+    assert body["tier_rule"] == "default"
     assert body["cached"] is False
     assert body["result"]["total_cost_eur"] == 25_000
 

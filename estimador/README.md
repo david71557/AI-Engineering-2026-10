@@ -8,6 +8,7 @@ Servicio FastAPI que genera estimaciones de proyectos software con un LLM, y un 
 - **Guardrails** de entrada (moderación, inyección de prompt, datos personales) y de salida (respuestas de baja confianza).
 - **Cachés** exacta y semántica en Redis Stack (solo en el endpoint transaccional).
 - **Sesiones conversacionales** (Sesión 5): memoria multi-turno y adjuntos PDF/Word en `/sessions`. Ver [más abajo](#sesión-5--memoria-conversacional-y-adjuntos).
+- **Memoria comprimida, tier dinámico y Actor-Critic-Boss** (Sesión 5, directo): anclas heurísticas, resumen acumulativo, audiencia derivada en cada turno y revisión con un crítico independiente. Ver [más abajo](#compresión-tier-dinámico-y-actor-critic-boss).
 
 ## Requisitos
 
@@ -35,6 +36,11 @@ ESTIMATOR_API_BASE_URL=http://localhost:8000
 MAX_CONVERSATION_TURNS=6        # pares user+assistant que guarda la ventana
 MAX_ATTACHMENT_CHARS=60000      # recorte por adjunto extraído
 METADATA_EXTRACTOR_MODEL=gpt-4o-mini
+ANCHOR_DETECTION_MODE=heuristic # heuristic (regex, sin LLM) | llm (clasificador)
+COMPRESSION_MODEL=gpt-4o-mini   # resumen acumulativo de turnos expulsados
+CONVERSATIONAL_PROMPT_VERSION=v2
+CRITIC_MODEL=gpt-4o-mini
+BOSS_MAX_ITERATIONS=3           # rondas actor+crítico como máximo
 ```
 
 Deja `REDIS_URL` con `localhost`: dentro de Docker el `docker-compose.yml` ya lo sobrescribe con `redis://redis:6379`, y con `redis` en el `.env` fallan las cachés cuando ejecutas algo fuera de Docker (tests, scripts, uvicorn local).
@@ -101,6 +107,7 @@ No llaman al LLM ni necesitan Docker ni Redis (el LLM, las cachés y la moderaci
 - **Endpoint transaccional** (`tests/routers/test_estimations.py`): versiones de prompt, guardrails, caché exacta y semántica, errores 400/422/502.
 - **Wrapper, esquema, cachés y guardrails** (`tests/test_llm_wrapper_structured.py`, `tests/test_cache_semantic.py`, `tests/test_guardrails_*.py`).
 - **Sesiones** (`tests/test_sessions_*.py`, `tests/test_metadata_extractor.py`, `tests/routers/test_sessions.py`).
+- **Compresión, tier y ACB** (`tests/test_compression.py`, `tests/test_tier_resolver.py`, `tests/test_acb.py`, `tests/test_sessions_live.py`).
 
 Los **tests del Paso 7** son de integración con `httpx.AsyncClient` sobre la app ASGI, con todo real salvo el LLM:
 
@@ -151,10 +158,14 @@ Para añadir una versión nueva:
 Además de `POST /api/v1/estimate` (que no cambia), el servicio soporta **sesiones**: el cliente refina el alcance en varios turnos, adjunta documentación y el servicio recuerda el proyecto entre llamadas.
 
 ```
-POST /sessions                         → 201 {"session_id": "<uuid v4>"}
-GET  /sessions/{session_id}            → 200 {session_id, message_count, max_turns, metadata}
-POST /sessions/{session_id}/estimate   → 200 EstimationResponse
-     multipart/form-data: transcript (20–80.000 caracteres), project_type, detail_level, output_format, attachments[] (opcional)
+POST /sessions                             → 201 {"session_id": "<uuid v4>"}
+GET  /sessions/{session_id}                → 200 {session_id, message_count, max_turns, metadata,
+                                                  anchors_count, summary_chars, summary,
+                                                  last_resolved_tier, last_tier_rule}
+POST /sessions/{session_id}/estimate       → 200 EstimationResponse (+ tier, tier_rule)
+POST /sessions/{session_id}/estimate-acb   → 200 ACBResponse (EstimationResponse + acb)
+     multipart/form-data: transcript (20–80.000 caracteres), project_type, detail_level, output_format,
+                          tier (opcional: executive | pm | developer | default), attachments[] (opcional)
 ```
 
 ```bash
@@ -205,7 +216,39 @@ Por qué un extractor LLM y no una heurística con regex: el nombre del proyecto
 
 ### Historial y coherencia entre turnos
 
-- **Ventana deslizante:** `ConversationHistory` guarda como máximo `MAX_CONVERSATION_TURNS` pares user+assistant y descarta los más antiguos de dos en dos. El system prompt no forma parte del historial: se regenera cada turno desde el `ProjectMetadata` actual, así que nunca se pierde. El LLM recibe `[system] + ventana + user actual` (`ConversationHistory.to_messages_list()`).
+- **Ventana deslizante:** `ConversationHistory` guarda como máximo `MAX_CONVERSATION_TURNS` pares user+assistant en la ventana reciente. El system prompt no forma parte del historial: se regenera cada turno desde el `ProjectMetadata` actual, así que nunca se pierde. Los pares que salen de la ventana no se tiran: pasan por la política de compresión (ver abajo). El LLM recibe `[system] + [resumen?] + anclas + ventana + user actual` (`ConversationHistory.to_messages_list()`).
 - **Última estimación como punto de partida:** la sesión guarda la última estimación (`Session.last_estimate`) y el prompt la incluye como `<current_estimate>`, con reglas para re-estimar el proyecto entero, no bajar el total al añadir alcance, quitar solo las fases del módulo eliminado y nombrar el proyecto. Sin esto, gpt-4o-mini estimaba solo lo nuevo y el total bajaba al añadir funcionalidades. Es una mejora del prompt verificada con el LLM real, no una garantía: no hay validador que lo imponga.
 - **Memoria en proceso:** `SessionStore` es un `dict` en memoria del worker, sin base de datos ni Redis. Se pierde al reiniciar y no se comparte entre workers; es intencional en esta fase.
 - **Sin cachés en el camino conversacional:** cada turno depende del historial y la metadata, así que `cached` es siempre `false`.
+
+### Compresión, tier dinámico y Actor-Critic-Boss
+
+Pipeline de cada turno (`EstimationService.estimate_conversational`):
+
+1. Guardrail de entrada sobre el transcript enriquecido.
+2. **Tier dinámico** (`app/sessions/tier_resolver.py`): el campo `tier` del formulario manda; si no viene, una cadena de reglas en orden decide sobre el transcript y la metadata acumulada, y gana la primera que encaja:
+   | Regla | Tier | Dispara con |
+   |---|---|---|
+   | `nda_detected` | `executive` | NDA, confidential, embargo… (transcript o `agreed_scope`) |
+   | `regulatory_context` | `executive` | HIPAA, GDPR, SOX, PCI-DSS, ISO 27001… (también en tecnologías) |
+   | `technical_audience` | `developer` | ≥ 2 palabras de infraestructura distintas (Kubernetes, Terraform, Kafka…) |
+   | `low_budget_pm` | `pm` | `assumed_team_size` ≤ 2 |
+   | — | `default` | ninguna |
+
+   Se recalcula en cada turno (una sesión pasa a `executive` el turno en que aparece un NDA). El prompt `conversation/v2` añade un bloque `<audience>` que cambia el tono y el enfoque, no las tarifas ni las reglas del `<current_estimate>`. La respuesta devuelve `tier` y `tier_rule`, y `GET /sessions/{id}` muestra el último.
+3. Prompt + LLM + validadores + guardrail de salida (igual que antes).
+4. **Compresión** (`app/sessions/compression/`): el turno se añade sin recortar y `CompressionPolicy` saca los pares que sobran de la ventana, de uno en uno:
+   - **Anclas heurísticas** (`AnchorDetector`, `ANCHOR_DETECTION_MODE=heuristic`): regex sobre el mensaje del usuario (NDA firmado, contrato/SOW firmado, alcance congelado, presupuesto cerrado, compliance, deadline duro, obligación contractual, compromiso explícito). Si encaja, el par entero pasa a `history.anchors` y viaja literal en cada turno, sin expulsarse nunca. Con `llm` se usa un clasificador en `COMPRESSION_MODEL` y, si falla, se vuelve a la heurística.
+   - **Summarizer acumulativo** (`CumulativeSummarizer`): el resto de pares expulsados se funden, junto con el resumen anterior, en un único resumen nuevo (prompt `conversation_summary/v1`, `COMPRESSION_MODEL`). Llega al LLM como primer mensaje del historial con la cabecera `[Earlier conversation summary …]`. Si la llamada falla se conserva el resumen previo; la ventana queda acotada igualmente.
+5. `last_estimate` y extractor de `ProjectMetadata` (igual que antes).
+
+**Actor-Critic-Boss** (`POST /sessions/{id}/estimate-acb`, `EstimationService.estimate_with_acb`):
+
+- **Actor:** la misma llamada conversacional. En los reintentos recibe en el prompt de usuario un bloque `<critic_feedback>` con los problemas señalados.
+- **Critic** (`app/services/critic.py`, prompt `critic/v1`, `CRITIC_MODEL`): auditor independiente que devuelve un `CriticFeedback` estructurado (`verdict` = `accept` | `needs_iteration` | `reject`, e `issues` con categoría, severidad y `field_path`). Recibe también la estimación anterior para detectar fases perdidas o totales que bajan sin que el usuario quite alcance. `needs_iteration` exige al menos un problema `critical`/`major`. Si el crítico falla, se acepta con confianza 0 (no bloquea el turno).
+- **Boss** (`app/services/boss.py`): máquina de estados sin LLM. `accept` → devuelve; `needs_iteration` con rondas disponibles → vuelve a llamar al actor con el feedback; `reject` o sin rondas (`BOSS_MAX_ITERATIONS`) → **sintetiza**: el último borrador con las advertencias abiertas delante del resumen y la confianza a la mitad (mínimo 30). Si las advertencias citan cifras que el validador `summary_matches_totals` rechazaría, usa una versión compacta sin descripciones, para que la respuesta siga siendo válida.
+- En la sesión se guarda **solo el resultado final** (un único par user/assistant, con el prompt limpio, sin el bloque del crítico). La respuesta incluye `acb`: las rondas con veredicto, confianza, problemas y la decisión del Boss.
+
+Coste por turno: el camino normal hace 2 llamadas (estimación + extractor) y 1 más cuando hay que resumir; ACB hace hasta `2 × BOSS_MAX_ITERATIONS` + 1 (+1 resumen).
+
+En Streamlit, la pestaña **Conversation** tiene un selector **Audience tier** (Auto = lo decide el servicio) y un interruptor **Review with Actor-Critic-Boss**; bajo cada respuesta se ve el tier y, con ACB, el rastro de auditoría. El panel lateral muestra anclas, resumen acumulativo y el último tier con la regla que lo decidió.

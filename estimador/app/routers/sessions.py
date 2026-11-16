@@ -1,14 +1,20 @@
 """Conversational endpoints for Session 5.
 
-Three endpoints:
+Four endpoints:
 
-- ``POST /sessions``                       — create a new session, return its UUID.
-- ``POST /sessions/{session_id}/estimate`` — multi-turn estimation. Accepts
+- ``POST /sessions``                           — create a new session, return its UUID.
+- ``POST /sessions/{session_id}/estimate``     — multi-turn estimation. Accepts
   ``multipart/form-data`` with the transcript plus optional file attachments
   (PDF or DOCX). Attachment text is extracted locally (Camino B) and
   concatenated into the transcript before the LLM is invoked.
-- ``GET  /sessions/{session_id}``          — debug view of the session
-  (metadata + history length).
+- ``POST /sessions/{session_id}/estimate-acb`` — same contract, run through
+  Actor-Critic-Boss; the response adds the ``acb`` audit trail.
+- ``GET  /sessions/{session_id}``              — debug view of the session
+  (metadata, window size, anchors, summary, last resolved tier).
+
+Both estimate endpoints accept an optional ``tier`` form field
+(executive | pm | developer | default). When present it overrides the tier
+the resolver would derive from the transcript + metadata.
 
 The client keeps the ``session_id`` returned by ``POST /sessions`` and sends
 it on every later request that should share the conversation's memory.
@@ -39,14 +45,16 @@ from app.config import get_settings
 from app.dependencies import get_estimation_service, get_session_store
 from app.guardrails.input import InputGuardrailViolation
 from app.schemas.estimation import (
+    ACBResponse,
     DetailLevel,
     EstimationResponse,
     OutputFormat,
     ProjectType,
 )
 from app.services.estimation import EstimationService
-from app.sessions.models import ProjectMetadata
+from app.sessions.models import ProjectMetadata, Session
 from app.sessions.store import SessionNotFoundError, SessionStore
+from app.sessions.tier_resolver import Tier
 
 log = structlog.get_logger()
 
@@ -62,6 +70,11 @@ class SessionInfoResponse(BaseModel):
     message_count: int
     max_turns: int
     metadata: ProjectMetadata
+    anchors_count: int = 0
+    summary_chars: int = 0
+    summary: str | None = None
+    last_resolved_tier: str | None = None
+    last_tier_rule: str | None = None
 
 
 @router.post("", response_model=CreateSessionResponse, status_code=201)
@@ -78,15 +91,17 @@ def get_session(
     session_id: str,
     store: SessionStore = Depends(get_session_store),
 ) -> SessionInfoResponse:
-    try:
-        session = store.get_or_404(session_id)
-    except SessionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="session_not_found") from exc
+    session = _get_session_or_404(store, session_id)
     return SessionInfoResponse(
         session_id=session.session_id,
         message_count=len(session.history.messages),
         max_turns=session.history.max_turns,
         metadata=session.metadata,
+        anchors_count=len(session.history.anchors),
+        summary_chars=len(session.history.summary or ""),
+        summary=session.history.summary,
+        last_resolved_tier=session.last_resolved_tier,
+        last_tier_rule=session.last_tier_rule,
     )
 
 
@@ -97,15 +112,67 @@ async def estimate_in_session(
     project_type: ProjectType = Form(...),
     detail_level: DetailLevel = Form(...),
     output_format: OutputFormat = Form(...),
+    tier: Tier | None = Form(default=None),
     attachments: list[UploadFile] = File(default_factory=list),
     store: SessionStore = Depends(get_session_store),
     service: EstimationService = Depends(get_estimation_service),
 ) -> EstimationResponse:
+    session = _get_session_or_404(store, session_id)
+    enriched = await _enrich_transcript(session_id, transcript, attachments)
+    return await _run_pipeline(
+        service.estimate_conversational,
+        session=session,
+        transcript=enriched,
+        project_type=project_type,
+        detail_level=detail_level,
+        output_format=output_format,
+        tier=tier,
+    )
+
+
+@router.post("/{session_id}/estimate-acb", response_model=ACBResponse)
+async def estimate_in_session_acb(
+    session_id: str,
+    transcript: str = Form(..., min_length=20, max_length=80_000),
+    project_type: ProjectType = Form(...),
+    detail_level: DetailLevel = Form(...),
+    output_format: OutputFormat = Form(...),
+    tier: Tier | None = Form(default=None),
+    attachments: list[UploadFile] = File(default_factory=list),
+    store: SessionStore = Depends(get_session_store),
+    service: EstimationService = Depends(get_estimation_service),
+) -> ACBResponse:
+    """Actor-Critic-Boss variant of ``/estimate``.
+
+    Same multipart contract; the response carries an ``acb`` field with the
+    iteration trail (verdict, confidence, issues per round) so callers can
+    show the audit trail in their UI.
+    """
+    session = _get_session_or_404(store, session_id)
+    enriched = await _enrich_transcript(session_id, transcript, attachments)
+    return await _run_pipeline(
+        service.estimate_with_acb,
+        session=session,
+        transcript=enriched,
+        project_type=project_type,
+        detail_level=detail_level,
+        output_format=output_format,
+        tier=tier,
+    )
+
+
+# --- shared helpers -----------------------------------------------------------
+
+
+def _get_session_or_404(store: SessionStore, session_id: str) -> Session:
     try:
-        session = store.get_or_404(session_id)
+        return store.get_or_404(session_id)
     except SessionNotFoundError as exc:
         raise HTTPException(status_code=404, detail="session_not_found") from exc
 
+
+async def _enrich_transcript(session_id: str, transcript: str, attachments: list[UploadFile]) -> str:
+    """Extract each attachment's text and append it to the transcript."""
     settings = get_settings()
     extracted: list[tuple[str, str]] = []
     for upload in attachments or []:
@@ -143,18 +210,17 @@ async def estimate_in_session(
         enriched_transcript_chars=len(enriched),
         attachment_count=len(extracted),
     )
+    return enriched
 
+
+async def _run_pipeline(pipeline, **kwargs):
+    """Run a blocking pipeline off the event loop and map its errors to HTTP.
+
+    The pipelines block on HTTP calls (moderation, several LLM calls), so they
+    run in the thread pool, as FastAPI does for the plain-``def`` v1 endpoint.
+    """
     try:
-        # The pipeline blocks on HTTP calls (moderation, LLM x2): run it off the
-        # event loop, as FastAPI does for the plain-``def`` v1 endpoint.
-        return await run_in_threadpool(
-            service.estimate_conversational,
-            session=session,
-            transcript=enriched,
-            project_type=project_type,
-            detail_level=detail_level,
-            output_format=output_format,
-        )
+        return await run_in_threadpool(pipeline, **kwargs)
     except InputGuardrailViolation as exc:
         log.info(
             "session_estimate_blocked_by_input_guardrail",

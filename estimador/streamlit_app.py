@@ -19,8 +19,11 @@ version, cached, model, latency, LLM cost). Three tabs:
   ``session_id`` kept in ``st.session_state``; each turn POSTs the transcript
   plus optional PDF/DOCX attachments as ``multipart/form-data``. The sidebar
   shows the service-side ``ProjectMetadata`` (the *memory*) next to the
-  history size (the *sliding window*), and "New conversation" calls
-  ``POST /sessions`` again and resets the state.
+  history size (the *sliding window*), the anchors and cumulative summary
+  (the *compression*) and the tier resolved on the last turn. Each turn can
+  force an audience tier or let the service derive it, and can run through
+  Actor-Critic-Boss (``/estimate-acb``), whose audit trail is shown under the
+  answer. "New conversation" calls ``POST /sessions`` again and resets the state.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from app.schemas.estimation import (
+    ACBResponse,
     DetailLevel,
     EstimationRequest,
     EstimationResponse,
@@ -45,6 +49,7 @@ from app.schemas.estimation import (
     ProjectType,
     PromptVersion,
 )
+from app.sessions.tier_resolver import Tier
 
 load_dotenv()
 
@@ -73,6 +78,15 @@ OUTPUT_FORMAT_LABELS = {
     OutputFormat.PHASES_TABLE: "Phases table",
     OutputFormat.LINE_ITEMS: "Line items",
     OutputFormat.NARRATIVE: "Narrative",
+}
+# "auto" sends no tier: the service derives it from the transcript + metadata.
+TIER_AUTO = "auto"
+TIER_LABELS = {
+    TIER_AUTO: "Auto (derived by the service)",
+    Tier.EXECUTIVE: "Executive",
+    Tier.PM: "Project manager",
+    Tier.DEVELOPER: "Developer",
+    Tier.DEFAULT: "Default",
 }
 # "compare" sends the same request once per version and shows the answers side by side.
 COMPARE_ALL = "compare"
@@ -135,24 +149,27 @@ def create_session() -> str:
 
 
 def fetch_session(session_id: str) -> dict:
-    """``GET /sessions/{id}`` → ``{session_id, message_count, max_turns, metadata}``."""
+    """``GET /sessions/{id}`` → metadata, window size, anchors, summary and last tier."""
     response = httpx.get(f"{SESSIONS_ENDPOINT}/{session_id}", timeout=httpx.Timeout(10.0))
     response.raise_for_status()
     return response.json()
 
 
-def estimate_in_session(session_id: str, form: dict, uploads: list) -> EstimationResponse:
-    """``POST /sessions/{id}/estimate`` as ``multipart/form-data``: the form
-    fields plus one ``attachments`` part per uploaded file."""
+def estimate_in_session(session_id: str, form: dict, uploads: list, *, acb: bool = False) -> EstimationResponse:
+    """``POST /sessions/{id}/estimate`` (or ``/estimate-acb``) as
+    ``multipart/form-data``: the form fields plus one ``attachments`` part per
+    uploaded file. The ACB variant answers with the audit trail in ``acb``."""
     files = [("attachments", (f.name, f.getvalue(), f.type or "application/octet-stream")) for f in uploads]
     response = httpx.post(
-        f"{SESSIONS_ENDPOINT}/{session_id}/estimate",
+        f"{SESSIONS_ENDPOINT}/{session_id}/{'estimate-acb' if acb else 'estimate'}",
         data=form,
         files=files or None,
-        timeout=httpx.Timeout(180.0, connect=10.0),
+        # ACB runs up to BOSS_MAX_ITERATIONS × (actor + critic) LLM calls.
+        timeout=httpx.Timeout(600.0 if acb else 180.0, connect=10.0),
     )
     response.raise_for_status()
-    return EstimationResponse.model_validate(response.json())
+    model = ACBResponse if acb else EstimationResponse
+    return model.model_validate(response.json())
 
 
 def start_new_conversation() -> None:
@@ -242,6 +259,11 @@ def render_estimation(container, entry: dict) -> None:
         badges.append(":gray-badge[fresh LLM call]")
     if resp.model:
         badges.append(f":violet-badge[{resp.model}]")
+    if resp.tier:
+        badges.append(f":red-badge[tier {resp.tier} · {resp.tier_rule}]")
+    acb = entry["response"].get("acb")
+    if acb:
+        badges.append(f":yellow-badge[ACB · {acb['final_decision']} after {acb['iterations_run']} round(s)]")
     container.markdown(" ".join(badges))
 
     c1, c2, c3 = container.columns(3)
@@ -269,6 +291,16 @@ def render_estimation(container, entry: dict) -> None:
     if resp.attempts and resp.attempts > 1:
         details.append(f"**{resp.attempts} attempts** to pass validation")
     container.caption(" · ".join(details))
+
+    if acb:
+        with container.expander("Actor-Critic-Boss audit trail"):
+            for it in acb["iterations"]:
+                st.markdown(
+                    f"**Round {it['iteration'] + 1}** — critic `{it['critic_verdict']}` "
+                    f"(confidence {it['critic_confidence']} %) → Boss **{it['decision_after']}**"
+                )
+                for issue in it["issue_summary"]:
+                    st.caption(issue)
 
 
 # --- Page -------------------------------------------------------------------
@@ -485,6 +517,19 @@ with tab_conversation:
             index=list(DetailLevel).index(DetailLevel.MEDIUM),
             horizontal=True,
         )
+        col_tier, col_acb = st.columns(2)
+        conv_tier = col_tier.selectbox(
+            "Audience tier",
+            options=[TIER_AUTO, *Tier],
+            format_func=TIER_LABELS.get,
+            help="Auto lets the service pick it each turn (NDA/compliance → executive, "
+            "infra keywords → developer, team of 1-2 → PM). Any other value overrides it.",
+        )
+        conv_acb = col_acb.toggle(
+            "Review with Actor-Critic-Boss",
+            help="An independent critic audits the draft; the boss re-asks the estimator "
+            "with the critic's issues until it accepts (more LLM calls, slower).",
+        )
         sent = st.form_submit_button(
             "Send", type="primary", disabled=st.session_state.session_id is None
         )
@@ -499,10 +544,14 @@ with tab_conversation:
                 "detail_level": conv_detail_level.value,
                 "output_format": conv_output_format.value,
             }
+            if conv_tier != TIER_AUTO:
+                form["tier"] = conv_tier.value
             with st.spinner("Calling the estimator service…"):
                 try:
                     t0 = time.perf_counter()
-                    response = estimate_in_session(st.session_state.session_id, form, attachments or [])
+                    response = estimate_in_session(
+                        st.session_state.session_id, form, attachments or [], acb=conv_acb
+                    )
                     roundtrip_ms = int((time.perf_counter() - t0) * 1000)
                 except httpx.HTTPStatusError as exc:
                     status, detail = exc.response.status_code, _error_detail(exc.response)
@@ -561,6 +610,15 @@ with st.sidebar:
             f"**History:** {info['message_count']} messages "
             f"({info['message_count'] // 2} of {info['max_turns']} turns in the window)"
         )
+        st.markdown(
+            f"**Anchors:** {info.get('anchors_count', 0) // 2} turn(s) kept verbatim · "
+            f"**Summary:** {info.get('summary_chars', 0)} chars"
+        )
+        if info.get("summary"):
+            with st.expander("Cumulative summary of evicted turns"):
+                st.caption(info["summary"])
+        if info.get("last_resolved_tier"):
+            st.markdown(f"**Last tier:** `{info['last_resolved_tier']}` ({info['last_tier_rule']})")
         st.subheader("Project metadata")
         metadata = info["metadata"]
         if not any(metadata.values()):

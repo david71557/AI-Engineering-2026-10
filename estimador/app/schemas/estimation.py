@@ -222,3 +222,22 @@ class EstimationResponse(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     attempts: int | None = Field(default=None, description="LLM calls needed to pass validation.")
+    tier: str | None = Field(
+        default=None, description="Audience tier resolved for this turn (conversational path only)."
+    )
+    tier_rule: str | None = Field(
+        default=None, description="Rule that decided the tier, e.g. 'nda_detected' or 'explicit_override'."
+    )
+
+
+from app.schemas.acb import BossTrace  # noqa: E402 — no cycle: acb imports nothing from app
+
+
+class ACBResponse(EstimationResponse):
+    """Conversational response with the Actor-Critic-Boss audit trail.
+
+    Same shape as ``EstimationResponse`` plus ``acb``: the iteration log
+    (verdict, confidence and issues per round, and the Boss's final decision).
+    """
+
+    acb: BossTrace

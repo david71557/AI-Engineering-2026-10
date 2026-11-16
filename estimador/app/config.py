@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     # The metadata extractor runs once per turn; a small/cheap model is enough.
     METADATA_EXTRACTOR_MODEL: str = "gpt-4o-mini"
 
+    # --- Session 5 live: compression + dynamic tier + Actor-Critic-Boss ---
+    # Anchor detector: "heuristic" (regex over key phrases, no LLM call) or
+    # "llm" (binary classifier on COMPRESSION_MODEL). Heuristic is the default for cost.
+    ANCHOR_DETECTION_MODE: Literal["heuristic", "llm"] = "heuristic"
+    # Cheap model used by the cumulative summarizer (history compression).
+    COMPRESSION_MODEL: str = "gpt-4o-mini"
+    # Conversational prompt version (app/prompts/conversation/<version>/).
+    # v1 = metadata + current estimate. v2 = adds the <audience> block driven
+    # by the resolved tier and the <critic_feedback> block used by the Boss.
+    CONVERSATIONAL_PROMPT_VERSION: str = "v2"
+    # Critic model (read-only auditor; cheap is fine).
+    CRITIC_MODEL: str = "gpt-4o-mini"
+    # Max Boss iterations (each = 1 actor + 1 critic call). Three is the
+    # practical floor: one draft + two directed retries; with two, the actor
+    # often can't address every flagged issue in its single retry.
+    BOSS_MAX_ITERATIONS: int = 3
+
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":
         """LiteLLM may try either provider via fallback, so we require at least one key."""

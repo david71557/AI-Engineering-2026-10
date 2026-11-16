@@ -113,12 +113,20 @@ def render_conversational_prompt(
     metadata: ProjectMetadata,
     previous_estimate: EstimationResult | None = None,
     version: str = "v1",
+    tier: object | None = None,
+    critic_feedback: object | None = None,
 ) -> tuple[str, str]:
     """Render the conversational system/user prompts (Session 5).
 
     ``previous_estimate`` (the session's last validated estimation, None on
     the first turn) is rendered as a ``<current_estimate>`` block so the model
     re-estimates the whole project on top of it instead of only the new scope.
+
+    v2 adds two blocks (v1 ignores both inputs):
+    - ``<audience>`` driven by ``tier`` (a ``Tier`` or its string value;
+      ``None`` renders as "default").
+    - ``<critic_feedback>`` in the user prompt, filled by the Boss when it
+      re-calls the actor with the Critic's issues (``CriticFeedback``).
 
     The system prompt includes a ``<project_metadata>`` block built from the
     current ``ProjectMetadata``. The user prompt carries the enriched
@@ -136,11 +144,67 @@ def render_conversational_prompt(
         "metadata": metadata,
         "metadata_is_empty": metadata.is_empty(),
         "previous_estimate": previous_estimate,
+        "tier": _tier_value(tier),
+        "critic_feedback": critic_feedback,
     }
     system = _env.get_template(f"conversation/{version}/system.j2").render(**context)
     user = _env.get_template(f"conversation/{version}/user.j2").render(**context)
     _log_render("conversation", version, system, user)
     return system, user
+
+
+def render_conversation_summary_prompt(
+    *,
+    previous_summary: str | None,
+    evicted: list,
+    version: str = "v1",
+) -> tuple[str, str]:
+    """Render the prompts used by the ``CumulativeSummarizer``.
+
+    ``evicted`` is a list of ``Message``-like objects (``role``, ``content``).
+    """
+    context = {"previous_summary": previous_summary or "", "evicted": evicted}
+    system = _env.get_template(f"conversation_summary/{version}/system.j2").render(**context)
+    user = _env.get_template(f"conversation_summary/{version}/user.j2").render(**context)
+    _log_render("conversation_summary", version, system, user)
+    return system, user
+
+
+def render_critic_prompt(
+    *,
+    transcript: str,
+    metadata: ProjectMetadata,
+    tier: object,
+    result: EstimationResult,
+    previous_estimate: EstimationResult | None = None,
+    detail_level: DetailLevel | str = DetailLevel.MEDIUM,
+    version: str = "v1",
+) -> tuple[str, str]:
+    """Render the Critic prompts (Actor-Critic-Boss).
+
+    ``previous_estimate`` is the session's baseline: the Critic uses it to
+    flag a draft that silently drops phases or gets cheaper without the user
+    removing scope (estimador's coherence rule).
+    """
+    context = {
+        "transcript": transcript,
+        "metadata": metadata,
+        "tier": _tier_value(tier),
+        "result": result,
+        "previous_estimate": previous_estimate,
+        "detail_level": detail_level.value if isinstance(detail_level, DetailLevel) else detail_level,
+    }
+    system = _env.get_template(f"critic/{version}/system.j2").render(**context)
+    user = _env.get_template(f"critic/{version}/user.j2").render(**context)
+    _log_render("critic", version, system, user)
+    return system, user
+
+
+def _tier_value(tier: object | None) -> str:
+    """Accept a ``Tier`` enum, its string value or ``None`` (→ "default")."""
+    if tier is None:
+        return "default"
+    return str(getattr(tier, "value", tier))
 
 
 def render_metadata_extraction_prompt(

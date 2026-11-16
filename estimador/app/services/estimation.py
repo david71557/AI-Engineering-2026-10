@@ -44,7 +44,9 @@ from app.guardrails.input import check_input
 from app.guardrails.output import enforce_scope_response
 from app.prompts import render_estimation_prompt
 from app.prompts.loader import render_conversational_prompt, template_hash
+from app.schemas.critic import CriticFeedback
 from app.schemas.estimation import (
+    ACBResponse,
     DetailLevel,
     EstimationRequest,
     EstimationResponse,
@@ -52,10 +54,14 @@ from app.schemas.estimation import (
     OutputFormat,
     ProjectType,
 )
+from app.services.boss import Boss
 from app.services.cache import EstimationCache
+from app.services.critic import Critic
 from app.services.llm_wrapper import LLMWrapper
+from app.sessions.compression import apply_compression
 from app.sessions.metadata_extractor import update_metadata
 from app.sessions.models import Session
+from app.sessions.tier_resolver import Tier, resolve_tier
 
 log = structlog.get_logger()
 
@@ -102,8 +108,12 @@ class EstimationService:
         semantic_cache: EstimationSemanticCache | None = None,
         openai_client: Any | None = None,
         prompt_version: str = "v1",
-        conversational_prompt_version: str = "v1",
+        conversational_prompt_version: str = "v2",
         metadata_extractor_model: str = "gpt-4o-mini",
+        compression_model: str = "gpt-4o-mini",
+        anchor_detection_mode: str = "heuristic",
+        critic_model: str = "gpt-4o-mini",
+        boss_max_iterations: int = 3,
     ) -> None:
         self.llm_wrapper = llm_wrapper
         self.exact_cache = exact_cache
@@ -112,6 +122,10 @@ class EstimationService:
         self.prompt_version = prompt_version
         self.conversational_prompt_version = conversational_prompt_version
         self.metadata_extractor_model = metadata_extractor_model
+        self.compression_model = compression_model
+        self.anchor_detection_mode = anchor_detection_mode
+        self.critic_model = critic_model
+        self.boss_max_iterations = boss_max_iterations
 
     def estimate(self, request: EstimationRequest, prompt_version: str | None = None) -> EstimationResponse:
         version = prompt_version or self.prompt_version
@@ -190,6 +204,7 @@ class EstimationService:
         project_type: ProjectType,
         detail_level: DetailLevel,
         output_format: OutputFormat,
+        tier: Tier | None = None,
     ) -> EstimationResponse:
         """Multi-turn estimation pipeline (Session 5).
 
@@ -198,43 +213,45 @@ class EstimationService:
           history + metadata, so two identical transcripts in different
           sessions are NOT the same call. ``cached`` is always ``False``.
         - The system prompt is the ``conversation`` template, which embeds the
-          current ``ProjectMetadata`` block. The LLM also receives the prior
-          user/assistant turns.
-        - After validation, the session's history is appended and a second
-          LLM call refreshes ``ProjectMetadata``.
-        """
-        # 1. Input guardrail on the enriched transcript (the caller has
-        #    already concatenated any extracted attachment text into it).
-        check_input(transcript, openai_client=self.openai_client)
+          current ``ProjectMetadata``, the previous estimate and (v2) the
+          ``<audience>`` block for the tier resolved this turn. The LLM also
+          receives the compressed history: summary + anchors + recent window.
+        - After validation the turn is appended, the history is compressed
+          (anchors promoted, the rest folded into the cumulative summary) and
+          a second LLM call refreshes ``ProjectMetadata``.
 
-        # 2. Render the conversational system + user prompts (they include
-        #    the <project_metadata> block).
-        system_prompt, user_message = render_conversational_prompt(
-            description=transcript,
+        Pipeline:
+            1. Input guardrail on the enriched transcript
+            2. Resolve the tier (override > rule chain > default)
+            3. Render prompts + build messages
+            4. LLM call (JSON + validators, re-prompt on failure)
+            5. Output guardrail
+            6. Append + compress + keep the baseline
+            7. Metadata extractor
+        """
+        resolved_tier, rule = self._prepare_turn(session=session, transcript=transcript, tier=tier)
+
+        system_prompt, user_message = self._render_turn(
+            session=session,
+            transcript=transcript,
             project_type=project_type,
             detail_level=detail_level,
             output_format=output_format,
-            metadata=session.metadata,
-            previous_estimate=session.last_estimate,
-            version=self.conversational_prompt_version,
+            tier=resolved_tier,
         )
-
-        # 3. Build the messages array: fresh system (just regenerated from the
-        #    current ProjectMetadata) + prior history (already bounded by the
-        #    sliding window) + current user.
-        messages = session.history.to_messages_list(
-            system_prompt=system_prompt, user_message=user_message
-        )
-
+        messages = session.history.to_messages_list(system_prompt=system_prompt, user_message=user_message)
         log.info(
             "estimation_conversational_request",
             session_id=session.session_id,
+            tier=resolved_tier.value,
+            tier_rule=rule,
             history_messages=len(session.history.messages),
+            anchors=len(session.history.anchors),
+            has_summary=bool(session.history.summary),
             metadata_is_empty=session.metadata.is_empty(),
             transcript_chars=len(transcript),
         )
 
-        # 4. LLM call: JSON + Pydantic validators, re-prompting on failure.
         result, meta = self.llm_wrapper.complete_structured_chat(
             messages=messages,
             response_model=EstimationResult,
@@ -247,30 +264,160 @@ class EstimationService:
             phases=len(result.phases),
             **meta,
         )
-
-        # 5. Output guardrail (filter policy: normalises low-confidence answers).
         result = enforce_scope_response(result)
 
-        # 6. Append the turn to the history (sliding window auto-trims) and keep
-        #    the result as the baseline the next turn must update.
-        session.history.append(user=user_message, assistant=result.model_dump_json())
-        session.last_estimate = result
+        self._commit_turn(session=session, transcript=transcript, user_message=user_message, result=result)
 
-        # 7. Second-pass extractor refreshes ProjectMetadata. Failure is
-        #    swallowed inside update_metadata (returns previous unchanged).
+        response = _response(result, f"conversation/{self.conversational_prompt_version}", meta, cache_type=None)
+        return response.model_copy(update={"tier": resolved_tier.value, "tier_rule": rule})
+
+    def estimate_with_acb(
+        self,
+        *,
+        session: Session,
+        transcript: str,
+        project_type: ProjectType,
+        detail_level: DetailLevel,
+        output_format: OutputFormat,
+        tier: Tier | None = None,
+    ) -> ACBResponse:
+        """Actor-Critic-Boss variant of the conversational pipeline.
+
+        - Actor: the same conversational LLM call as ``estimate_conversational``,
+          re-rendered each iteration so the Critic's issues travel in a
+          ``<critic_feedback>`` block.
+        - Critic: an independent, read-only audit returning ``CriticFeedback``.
+        - Boss: a deterministic state machine (accept / iterate / synthesize).
+
+        The session is updated **only** with the final Boss-approved (or
+        synthesized) result — intermediate drafts are throwaway, so from the
+        user's point of view the turn produced exactly one assistant message.
+        The history stores the clean user prompt, without the critic block.
+        """
+        resolved_tier, rule = self._prepare_turn(session=session, transcript=transcript, tier=tier)
+        log.info(
+            "estimation_acb_request",
+            session_id=session.session_id,
+            tier=resolved_tier.value,
+            tier_rule=rule,
+            transcript_chars=len(transcript),
+        )
+
+        render_kwargs = dict(
+            session=session,
+            transcript=transcript,
+            project_type=project_type,
+            detail_level=detail_level,
+            output_format=output_format,
+            tier=resolved_tier,
+        )
+        _, clean_user_message = self._render_turn(**render_kwargs)
+        attempts_meta: list[dict] = []
+
+        def _actor(critic_feedback: CriticFeedback | None) -> EstimationResult:
+            system_prompt, user_message = self._render_turn(**render_kwargs, critic_feedback=critic_feedback)
+            messages = session.history.to_messages_list(system_prompt=system_prompt, user_message=user_message)
+            draft, meta = self.llm_wrapper.complete_structured_chat(
+                messages=messages,
+                response_model=EstimationResult,
+            )
+            attempts_meta.append(meta)
+            log.info(
+                "acb_actor_draft",
+                with_critic_feedback=critic_feedback is not None,
+                issues_in_feedback=len(critic_feedback.issues) if critic_feedback is not None else 0,
+                confidence_pct=draft.confidence_pct,
+                total_cost_eur=draft.total_cost_eur,
+                **meta,
+            )
+            return enforce_scope_response(draft)
+
+        critic = Critic(llm_wrapper=self.llm_wrapper, model=self.critic_model)
+        baseline = session.last_estimate
+
+        def _critic(draft: EstimationResult) -> CriticFeedback:
+            return critic.review(
+                transcript=transcript,
+                metadata=session.metadata,
+                tier=resolved_tier,
+                result=draft,
+                previous_estimate=baseline,
+                detail_level=detail_level,
+            )
+
+        final_result, trace = Boss(max_iterations=self.boss_max_iterations).run(actor=_actor, critic=_critic)
+
+        self._commit_turn(session=session, transcript=transcript, user_message=clean_user_message, result=final_result)
+
+        # Call metadata of the last actor draft (the one the Boss returned).
+        base = _response(final_result, f"conversation/{self.conversational_prompt_version}", attempts_meta[-1], cache_type=None)
+        return ACBResponse(
+            **{**base.model_dump(exclude={"result"}), "tier": resolved_tier.value, "tier_rule": rule},
+            result=final_result,
+            acb=trace,
+        )
+
+    # -- conversational helpers -------------------------------------------
+
+    def _prepare_turn(self, *, session: Session, transcript: str, tier: Tier | None) -> tuple[Tier, str]:
+        """Input guardrail on the enriched transcript (attachment text
+        included), then resolve the tier dynamically for THIS turn and cache
+        it on the session for ``GET /sessions/{id}``."""
+        check_input(transcript, openai_client=self.openai_client)
+        resolved_tier, rule = resolve_tier(transcript=transcript, metadata=session.metadata, override=tier)
+        session.last_resolved_tier = resolved_tier.value
+        session.last_tier_rule = rule
+        return resolved_tier, rule
+
+    def _render_turn(
+        self,
+        *,
+        session: Session,
+        transcript: str,
+        project_type: ProjectType,
+        detail_level: DetailLevel,
+        output_format: OutputFormat,
+        tier: Tier,
+        critic_feedback: CriticFeedback | None = None,
+    ) -> tuple[str, str]:
+        """System prompt regenerated from the CURRENT metadata + baseline + tier."""
+        return render_conversational_prompt(
+            description=transcript,
+            project_type=project_type,
+            detail_level=detail_level,
+            output_format=output_format,
+            metadata=session.metadata,
+            previous_estimate=session.last_estimate,
+            version=self.conversational_prompt_version,
+            tier=tier,
+            critic_feedback=critic_feedback,
+        )
+
+    def _commit_turn(self, *, session: Session, transcript: str, user_message: str, result: EstimationResult) -> None:
+        """Persist one validated turn.
+
+        1. Append without trimming, then let ``CompressionPolicy`` evict the
+           overflow: anchor pairs are promoted verbatim, the rest are folded
+           into the cumulative summary (cheap model). Best-effort: a failing
+           summarizer keeps the previous summary, the window is still bounded.
+        2. Keep the result as the baseline the next turn must update.
+        3. Second-pass extractor refreshes ``ProjectMetadata`` (failure is
+           swallowed inside ``update_metadata``).
+        """
+        session.history.append(user=user_message, assistant=result.model_dump_json(), trim=False)
+        apply_compression(
+            session.history,
+            llm_wrapper=self.llm_wrapper,
+            compression_model=self.compression_model,
+            anchor_detection_mode=self.anchor_detection_mode,
+        )
+        session.last_estimate = result
         session.metadata = update_metadata(
             previous=session.metadata,
             transcript=transcript,
             result=result,
             llm_wrapper=self.llm_wrapper,
             model=self.metadata_extractor_model,
-        )
-
-        return _response(
-            result,
-            f"conversation/{self.conversational_prompt_version}",
-            meta,
-            cache_type=None,
         )
 
     def _read_exact(self, cache_key: str) -> tuple[EstimationResult, dict] | None:

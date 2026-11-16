@@ -50,13 +50,20 @@ class FakeLLMWrapper:
     """In-process double of ``LLMWrapper`` for conversational tests.
 
     Captures every ``complete_structured_chat`` call. Returns scripted
-    EstimationResult / ProjectMetadata pairs in order, one pair per turn.
+    EstimationResult / ProjectMetadata pairs, one pair per turn: the turn
+    index advances on the ProjectMetadata call (the extractor always closes a
+    turn), so extra actor drafts inside an ACB loop reuse the same turn.
+
+    Any other ``response_model`` (the summarizer's envelope, the anchor
+    classifier, the Critic's feedback) gets the factory registered with
+    ``register_response_for(schema, factory)`` or a sensible default.
     """
 
     def __init__(self) -> None:
         self.chat_calls: list[dict] = []
         self.scripted: list[tuple[EstimationResult, ProjectMetadata]] = []
         self._turn = 0
+        self._extra_factories: dict[type, object] = {}
 
     def add_turn(
         self,
@@ -68,6 +75,35 @@ class FakeLLMWrapper:
             (result or make_canned_result(), metadata or ProjectMetadata())
         )
 
+    def register_response_for(self, schema: type, factory) -> None:
+        """``factory`` is a zero-arg callable returning an instance of ``schema``."""
+        self._extra_factories[schema] = factory
+
+    def calls_for(self, schema_name: str) -> list[dict]:
+        return [c for c in self.chat_calls if c["response_model"] == schema_name]
+
+    def _scripted_turn(self) -> tuple[EstimationResult, ProjectMetadata]:
+        idx = self._turn // 2
+        if idx >= len(self.scripted):
+            # Pad with neutral results so tests that exercise extra turns
+            # (sliding window) don't have to script every single one.
+            self.scripted.append((make_canned_result(), ProjectMetadata()))
+        return self.scripted[idx]
+
+    @staticmethod
+    def _default_for(schema: type):
+        from app.schemas.critic import CriticFeedback
+        from app.sessions.compression.anchors import _AnchorClassification
+        from app.sessions.compression.summarizer import _SummaryEnvelope
+
+        if schema is _SummaryEnvelope:
+            return _SummaryEnvelope(summary="(canned summary for tests)")
+        if schema is _AnchorClassification:
+            return _AnchorClassification(is_anchor=False, reason="default")
+        if schema is CriticFeedback:
+            return CriticFeedback(verdict="accept", issues=[], confidence_in_review=90)
+        return schema()
+
     def complete_structured_chat(self, *, messages, response_model, **kwargs):
         self.chat_calls.append(
             {
@@ -76,17 +112,23 @@ class FakeLLMWrapper:
                 "kwargs": kwargs,
             }
         )
-        idx = self._turn // 2
-        if idx >= len(self.scripted):
-            # Pad with neutral results so tests that exercise extra turns
-            # (sliding window) don't have to script every single one.
-            self.scripted.append((make_canned_result(), ProjectMetadata()))
-        result, metadata = self.scripted[idx]
-        self._turn += 1
         meta = {"model": "gpt-4o-mini", "provider": "openai", "latency_ms": 1}
+
         if response_model is EstimationResult:
+            result, _ = self._scripted_turn()
+            if self._turn % 2 == 0:
+                self._turn += 1  # first draft of the turn; ACB re-drafts don't advance
             return result, meta
-        return metadata, meta
+
+        if response_model is ProjectMetadata:
+            _, metadata = self._scripted_turn()
+            self._turn += 1 if self._turn % 2 == 1 else 2
+            return metadata, meta
+
+        factory = self._extra_factories.get(response_model)
+        if factory is not None:
+            return factory(), meta
+        return self._default_for(response_model), meta
 
 
 @pytest.fixture

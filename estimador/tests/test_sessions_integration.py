@@ -29,7 +29,8 @@ from app.dependencies import get_estimation_service, get_session_store
 from app.main import app
 from app.schemas.estimation import EstimationResult
 from app.services.estimation import EstimationService
-from app.sessions.models import ProjectMetadata
+from app.sessions.compression.summarizer import _SummaryEnvelope
+from app.sessions.models import SUMMARY_ENVELOPE_PREFIX, ProjectMetadata
 from app.sessions.store import SessionStore
 
 pytestmark = pytest.mark.anyio
@@ -82,6 +83,11 @@ class ReactiveFakeLLM:
         self.calls.append({"messages": messages, "response_model": response_model, "kwargs": kwargs})
         meta = {"model": "fake-llm", "provider": "fake", "latency_ms": 1}
         current_user = messages[-1]["content"]
+
+        if response_model is _SummaryEnvelope:
+            # The cumulative summarizer: record which turns it absorbed.
+            evicted = re.findall(r"Turn (\d+):", current_user)
+            return _SummaryEnvelope(summary=f"Earlier turns {', '.join(sorted(set(evicted)))} refined the CRM."), meta
 
         if response_model is EstimationResult:
             phases = list(BASE_PHASES)
@@ -266,10 +272,16 @@ async def test_eight_turns_never_send_more_than_max_turns_of_history(
 
     for n, call in enumerate(calls):
         messages = call["messages"]
-        # Shape: [system] + history pairs + [current user].
+        # Shape: [system] + [summary?] + history pairs + [current user].
         assert messages[0]["role"] == "system"  # the invariant: always present, always first
         assert messages[-1]["role"] == "user" and f"Turn {n}:" in messages[-1]["content"]
         history = messages[1:-1]
+        # Once turn 0 has been evicted (from turn max_turns+1 on), the evicted
+        # turns travel as ONE summary envelope right after the system prompt.
+        has_summary = history[:1] and history[0]["content"].startswith(SUMMARY_ENVELOPE_PREFIX)
+        assert bool(has_summary) == (n > max_turns)
+        if has_summary:
+            history = history[1:]
         history_turns = len(history) // 2
         assert history_turns <= max_turns, f"turn {n} sent {history_turns} turns of history (max {max_turns})"
         assert history_turns == min(n, max_turns)  # grows, then stays capped
@@ -280,8 +292,12 @@ async def test_eight_turns_never_send_more_than_max_turns_of_history(
     def turns_in(messages: list[dict]) -> list[int]:
         return [int(re.search(r"Turn (\d+):", m["content"]).group(1)) for m in messages if m["role"] == "user"]
 
-    assert turns_in(calls[-1]["messages"][1:-1]) == list(range(8 - max_turns - 1, 7))
-    # After answering turn 7 the stored window holds turns 2..7.
-    stored = store.get_or_404(session_id).history.messages
+    assert turns_in(calls[-1]["messages"][2:-1]) == list(range(8 - max_turns - 1, 7))
+    # After answering turn 7 the stored window holds turns 2..7, and turns
+    # 0..1 live on only in the cumulative summary.
+    history = store.get_or_404(session_id).history
+    stored = history.messages
     assert len(stored) == 2 * max_turns
     assert turns_in([{"role": m.role, "content": m.content} for m in stored]) == list(range(8 - max_turns, 8))
+    assert history.summary.startswith("Earlier turns")
+    assert history.anchors == []

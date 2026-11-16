@@ -58,24 +58,26 @@ def test_eight_turns_never_exceed_window(
         response = client.post(f"/sessions/{session_id}/estimate", data=body)
         assert response.status_code == 200, response.text
 
-    # 8 turns × 2 calls (estimation + extractor) = 16 chat_calls
-    assert len(fake_wrapper.chat_calls) == 16
-
-    # Inspect only the estimation calls (even indexes).
-    estimation_calls = fake_wrapper.chat_calls[::2]
+    # 8 turns × (estimation + extractor), plus one summarizer call for every
+    # turn that overflowed the window (turns 3..7 → 5 calls).
+    estimation_calls = fake_wrapper.calls_for("EstimationResult")
     assert len(estimation_calls) == 8
+    assert len(fake_wrapper.calls_for("ProjectMetadata")) == 8
+    assert len(fake_wrapper.calls_for("_SummaryEnvelope")) == 5
 
-    # max_turns=3 → at most 3 user/assistant pairs from history,
-    # plus 1 system + 1 current user. Cap = 1 + 6 + 1 = 8.
+    # max_turns=3 → at most 3 user/assistant pairs from history, plus
+    # 1 system + 1 summary envelope + 1 current user. Cap = 1 + 1 + 6 + 1 = 9.
     for idx, call in enumerate(estimation_calls):
-        assert len(call["messages"]) <= 8, (
+        assert len(call["messages"]) <= 9, (
             f"Estimation call {idx} sent {len(call['messages'])} messages; "
-            "the sliding window should cap it at 8."
+            "the sliding window + summary should cap it at 9."
         )
 
     # And the session history itself stays bounded:
     session = store.get_or_404(session_id)
     assert len(session.history.messages) <= 3 * 2
+    assert session.history.summary == "(canned summary for tests)"
+    assert session.history.anchors == []
 
 
 def test_history_keeps_most_recent_pairs(
