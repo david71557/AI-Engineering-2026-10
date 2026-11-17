@@ -201,3 +201,6 @@ class Session(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_resolved_tier: str | None = None
     last_tier_rule: str | None = None
+    # Turns committed so far (actor or ACB). Monotonic, unlike the window
+    # size, which plateaus at ``max_turns`` once compression starts evicting.
+    turn_count: int = Field(default=0, ge=0)

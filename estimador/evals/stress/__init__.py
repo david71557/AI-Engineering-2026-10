@@ -6,7 +6,11 @@ recall drift.
 
 - ``scenarios`` — three synthetic multi-turn profiles with fact-trackers
                   (``growing``, ``pivot``, ``contradiction``).
+- ``metrics``   — ``LatencyBudgetMetric``, ``CostBudgetMetric``,
+                  ``MemoryDriftMetric``. They read ``TurnObservation`` + the
+                  session snapshot, not ``EstimationResult`` — hence kept
+                  apart from ``evals.metrics`` (``MetricResult`` is reused).
+- ``fixtures``  — ``build_pdfs.py`` regenerates the synthetic attachments.
 
-Next steps add ``metrics`` (latency/cost budgets + ``MemoryDriftMetric``) and
-``run`` (the CLI runner that writes ``results.csv``).
+The next step adds ``run`` (the CLI runner that writes ``results.csv``).
 """

@@ -294,8 +294,12 @@ class EstimationService:
         )
         log.info("turn_observed", **observation.model_dump())
 
+        # The same observation travels in the response, so the stress runner
+        # (and Streamlit) read it from the JSON instead of parsing logs.
         response = _response(result, f"conversation/{self.conversational_prompt_version}", meta, cache_type=None)
-        return response.model_copy(update={"tier": resolved_tier.value, "tier_rule": rule})
+        return response.model_copy(
+            update={"tier": resolved_tier.value, "tier_rule": rule, "observation": observation}
+        )
 
     def estimate_with_acb(
         self,
@@ -420,11 +424,12 @@ class EstimationService:
         )
 
     def _commit_turn(self, *, session: Session, transcript: str, user_message: str, result: EstimationResult) -> int:
-        """Persist one validated turn and return its ``turn_index``.
+        """Persist one validated turn and return its 1-based ``turn_index``.
 
-        ``turn_index`` is captured right after the append and BEFORE
-        compression (same as estimator): compression evicts pairs out of the
-        window, so measured afterwards it would under-count.
+        ``turn_index`` comes from ``session.turn_count``, a monotonic counter.
+        Deriving it from the window (``len(messages) // 2``, as estimator
+        does) plateaus at ``max_turns + 1`` once compression evicts pairs,
+        which would make every turn past the 7th look like turn 7.
 
         1. Append without trimming, then let ``CompressionPolicy`` evict the
            overflow: anchor pairs are promoted verbatim, the rest are folded
@@ -435,7 +440,7 @@ class EstimationService:
            swallowed inside ``update_metadata``).
         """
         session.history.append(user=user_message, assistant=result.model_dump_json(), trim=False)
-        turn_index = len(session.history.messages) // 2
+        session.turn_count += 1
         apply_compression(
             session.history,
             llm_wrapper=self.llm_wrapper,
@@ -450,7 +455,7 @@ class EstimationService:
             llm_wrapper=self.llm_wrapper,
             model=self.metadata_extractor_model,
         )
-        return turn_index
+        return session.turn_count
 
     def _read_exact(self, cache_key: str) -> tuple[EstimationResult, dict] | None:
         cached = self.exact_cache.get(cache_key)

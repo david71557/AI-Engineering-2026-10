@@ -38,8 +38,8 @@ from typing import Literal
 from app.schemas.estimation import DetailLevel, OutputFormat, ProjectType
 
 # Where ``MemoryDriftMetric`` scopes its search in the session snapshot.
-# Defined here (estimator keeps it in ``metrics``) because the stress metrics
-# module does not exist yet in estimador; ``metrics`` will import it from here.
+# Defined here (estimator keeps it in ``metrics``) so ``scenarios`` stays a
+# leaf module; ``evals.stress.metrics`` imports and re-exports it.
 FactField = Literal["project_name", "technologies", "scope", "summary", "any"]
 
 ScenarioName = Literal["growing", "pivot", "contradiction"]

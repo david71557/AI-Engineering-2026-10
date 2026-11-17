@@ -254,6 +254,11 @@ class EstimationResponse(BaseModel):
     tier_rule: str | None = Field(
         default=None, description="Rule that decided the tier, e.g. 'nda_detected' or 'explicit_override'."
     )
+    observation: TurnObservation | None = Field(
+        default=None,
+        description="Per-turn telemetry (same payload as the turn_observed log event). "
+        "Only POST /sessions/{id}/estimate fills it; older callers can ignore it.",
+    )
 
 
 from app.schemas.acb import BossTrace  # noqa: E402 — no cycle: acb imports nothing from app

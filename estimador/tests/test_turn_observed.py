@@ -48,6 +48,9 @@ def test_turn_observed_has_the_13_fields(conversational_client) -> None:
     assert event["latency_ms"] == 1  # from the fake wrapper's meta
     assert event["last_resolved_tier"] is not None
 
+    # The response carries the very same observation the log event emitted.
+    assert response.json()["observation"] == {k: event[k] for k in EXPECTED_FIELDS}
+
 
 def test_turn_index_grows_and_attachments_are_counted(conversational_client) -> None:
     client, _ = conversational_client

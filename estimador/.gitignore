@@ -16,3 +16,5 @@ __pycache__/
 
 # Adjuntos sintéticos del stress test (los regenera evals/stress/fixtures/build_pdfs.py)
 evals/stress/fixtures/*.pdf
+# Ejecuciones de prueba del runner (results.csv sí se versiona: es la evidencia del REPORT.md)
+evals/stress/smoke*.csv

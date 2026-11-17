@@ -481,6 +481,23 @@ with tab_conversation:
         with st.chat_message("assistant"):
             render_estimation(st, turn["entry"])
 
+    # Session 6: one row per turn, the same 13 fields as the turn_observed
+    # event and the stress runner's CSV (ACB turns carry no observation).
+    observations = [t["entry"]["response"].get("observation") for t in st.session_state.turns]
+    observations = [o for o in observations if o]
+    if observations:
+        with st.expander(f"Turn telemetry · turn_observed ({len(observations)} turn(s))", expanded=False):
+            st.dataframe(
+                pd.DataFrame(observations).drop(columns=["session_id"]),
+                hide_index=True,
+                width="stretch",
+                column_config={"cost_usd": st.column_config.NumberColumn("cost_usd", format="$%.5f")},
+            )
+            st.caption(
+                "Watch messages_in_window plateau while summary_chars grows, and how "
+                "tokens_in / cost_usd follow attachments_total_chars."
+            )
+
     with st.form(f"conversation_form_{st.session_state.conversation_form_key}", clear_on_submit=False):
         transcript = st.text_area(
             "Transcript",
