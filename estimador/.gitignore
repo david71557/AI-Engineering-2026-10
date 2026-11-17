@@ -13,3 +13,6 @@ __pycache__/
 
 # Historial local de estimaciones del cliente Streamlit
 .estimations_history.json
+
+# Adjuntos sintéticos del stress test (los regenera evals/stress/fixtures/build_pdfs.py)
+evals/stress/fixtures/*.pdf
