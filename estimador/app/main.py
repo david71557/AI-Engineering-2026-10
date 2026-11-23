@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
+from app.embedding_pipeline.router import router as embeddings_router
 from app.routers import estimations, ingestion, sessions
 
 
@@ -37,6 +38,7 @@ app = FastAPI(
 app.include_router(estimations.router)
 app.include_router(sessions.router)
 app.include_router(ingestion.router)
+app.include_router(embeddings_router)
 
 
 @app.get("/health")
