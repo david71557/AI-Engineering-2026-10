@@ -1,0 +1,129 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-11-23T16:43:19.849747+00:00",
+  "source_name": "presupuestos_json",
+  "source_version": "1.0.0",
+  "pseudonymized": false,
+  "count": 4,
+  "budgets": [
+    {
+      "budget_id": "BUDGET-2024-0001",
+      "client_name": "Acme España S.L.",
+      "client_code": "CLI-0042",
+      "currency": "EUR",
+      "total_amount": 45000.0,
+      "signed_at": "2024-02-14",
+      "phases": [
+        {
+          "name": "Discovery",
+          "weeks": 2.0,
+          "amount": 8000.0
+        },
+        {
+          "name": "Diseño UX",
+          "weeks": 3.0,
+          "amount": 12000.0
+        },
+        {
+          "name": "Implementación MVP",
+          "weeks": 6.0,
+          "amount": 20000.0
+        },
+        {
+          "name": "Pruebas y despliegue",
+          "weeks": 1.0,
+          "amount": 5000.0
+        }
+      ],
+      "total_weeks": 12.0,
+      "contact": "Laura Fernández",
+      "contact_email": "laura.fernandez@acme.es",
+      "notes": "Proyecto B2B SaaS interno con integración a Workday.",
+      "content_hash": "2e11d1f5ac8a00cf47911f057ac4c2228ffbaa6f01cd458a7cc1fbf02c1a3e54",
+      "source_file": "budgets/BUDGET-2024-0001.json"
+    },
+    {
+      "budget_id": "BUDGET-2024-0002",
+      "client_name": "BetaNorte Distribución",
+      "client_code": "CLI-0078",
+      "currency": "EUR",
+      "total_amount": 28000.0,
+      "signed_at": "2024-03-12",
+      "phases": [
+        {
+          "name": "Auditoría procesos",
+          "weeks": 2.0,
+          "amount": 6000.0
+        },
+        {
+          "name": "Backend integraciones",
+          "weeks": 4.0,
+          "amount": 14000.0
+        },
+        {
+          "name": "Cuadros de mando",
+          "weeks": 2.0,
+          "amount": 8000.0
+        }
+      ],
+      "total_weeks": 8.0,
+      "contact": "Javier Romero",
+      "contact_email": "j.romero@betanorte.com",
+      "notes": "Migración del ERP legado. Tres almacenes.",
+      "content_hash": "1b28819fb3b50e5878910c734d0031922da4ab42d7a1dcdaee1b664e457199e4",
+      "source_file": "budgets/BUDGET-2024-0002.json"
+    },
+    {
+      "budget_id": "BUDGET-2024-0003",
+      "client_name": null,
+      "client_code": "CLI-0103",
+      "currency": "EUR",
+      "total_amount": 18500.0,
+      "signed_at": "2024-05-02",
+      "phases": [
+        {
+          "name": "Prototipo",
+          "weeks": 3.0,
+          "amount": 9500.0
+        },
+        {
+          "name": "Integración pasarela",
+          "weeks": 2.0,
+          "amount": 9000.0
+        }
+      ],
+      "total_weeks": 5.0,
+      "contact": null,
+      "contact_email": null,
+      "notes": "Cliente cierre comercial pendiente, no confirmado.",
+      "content_hash": "33a46273d282a08ea7a3f381e233123fac54b7d8bd67dea3d9ccb13e8bdd1906",
+      "source_file": "budgets/BUDGET-2024-0003.json"
+    },
+    {
+      "budget_id": "BUDGET-2024-0005",
+      "client_name": "Industrias Toledo",
+      "client_code": "CLI-0288",
+      "currency": "EUR",
+      "total_amount": 32000.0,
+      "signed_at": "2024-04-12",
+      "phases": [
+        {
+          "name": "Discovery",
+          "weeks": 2.0,
+          "amount": 6000.0
+        },
+        {
+          "name": "Implementación",
+          "weeks": 6.0,
+          "amount": 26000.0
+        }
+      ],
+      "total_weeks": 8.0,
+      "contact": "Carmen Vidal",
+      "contact_email": "carmen.vidal@toledo-ind.es",
+      "notes": "Revisión tras alcance ampliado en reunión del 11/04.",
+      "content_hash": "ad53db1304e52883dd9ea7c772216bab8f77bd847c89d8334815b44583e89dbc",
+      "source_file": "budgets/BUDGET-2024-0005-v2.json"
+    }
+  ]
+}

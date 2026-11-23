@@ -10,6 +10,9 @@ from openai import OpenAI
 
 from app.cache.semantic import EstimationSemanticCache, OpenAIEmbedder
 from app.config import get_settings
+from app.ingestion.catalog import DataCatalog, load_catalog
+from app.ingestion.loaders.filesystem import FileSystemLoader
+from app.ingestion.parsers.registry import ParserRegistry, default_registry
 from app.services.cache import EstimationCache
 from app.services.estimation import EstimationService
 from app.services.llm_wrapper import LLMWrapper
@@ -109,3 +112,47 @@ def get_estimation_service() -> EstimationService:
         critic_model=settings.CRITIC_MODEL,
         boss_max_iterations=settings.BOSS_MAX_ITERATIONS,
     )
+
+
+# --- Session 6: ingestion + PII ---------------------------------------------
+
+
+def build_pseudonymizer(session):
+    """Build a :class:`ConsistentPseudonymizer` backed by Postgres.
+
+    Not a singleton — the mapping store wraps a Session, so callers (scripts,
+    BackgroundTasks, tests) must pass their own. The analyzer (singleton via
+    ``build_analyzer``) and the salt come from settings.
+    """
+    from app.ingestion.pii import (
+        ConsistentPseudonymizer,
+        PostgresMappingStore,
+        build_analyzer,
+    )
+
+    settings = get_settings()
+    return ConsistentPseudonymizer(
+        analyzer=build_analyzer(),
+        mapping_store=PostgresMappingStore(session),
+        salt=settings.PSEUDONYM_HASH_SALT,
+        faker_locale=settings.PSEUDONYM_FAKER_LOCALE,
+        language="es",
+    )
+
+
+@lru_cache
+def get_catalog() -> DataCatalog:
+    """Load and cache the data-source catalog. A new catalog version requires
+    a process restart by design."""
+    return load_catalog(get_settings().CATALOG_PATH)
+
+
+@lru_cache
+def get_filesystem_loader() -> FileSystemLoader:
+    return FileSystemLoader(data_root=get_settings().INGESTION_DATA_ROOT)
+
+
+@lru_cache
+def get_parser_registry() -> ParserRegistry:
+    """Registry of parsers available (JSON budgets + TXT transcripts)."""
+    return default_registry()

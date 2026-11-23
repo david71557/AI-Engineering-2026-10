@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-11-23T16:43:19.849747+00:00",
+  "source_name": "presupuestos_json",
+  "source_version": "1.0.0",
+  "pseudonymized": false,
+  "count": 1,
+  "budgets": [
+    {
+      "budget_id": "BUDGET-2024-0004",
+      "bucket": "discarded",
+      "reasons": [
+        "total_amount:greater_than_or_equal_to(0)"
+      ],
+      "record": {
+        "budget_id": "BUDGET-2024-0004",
+        "client_name": "Cooperativa Levante",
+        "client_code": "CLI-0211",
+        "currency": "EUR",
+        "total_amount": -50000.0,
+        "signed_at": "2024-06-21",
+        "phases": [
+          {
+            "name": "Refactor crédito",
+            "weeks": 5.0,
+            "amount": -30000.0
+          },
+          {
+            "name": "Reporting regulatorio",
+            "weeks": 4.0,
+            "amount": -20000.0
+          }
+        ],
+        "contact": "Pilar Alonso",
+        "contact_email": "pilar.alonso@cooplevante.coop",
+        "notes": "Carga inversa por nota de abono. Importes negativos deliberados.",
+        "source_file": "budgets/BUDGET-2024-0004.json",
+        "content_hash": "7027b8b9780a85da8ccc0cba065b3281b24b694be89a2913438a252c66509c95",
+        "total_weeks": 9.0
+      }
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import model_validator
@@ -64,6 +65,25 @@ class Settings(BaseSettings):
     # practical floor: one draft + two directed retries; with two, the actor
     # often can't address every flagged issue in its single retry.
     BOSS_MAX_ITERATIONS: int = 3
+
+    # --- Session 6 fields (data-driven AI: persistence + ingestion + PII) ---
+    # Postgres connection string. pgvector/pgvector:pg16 image; the extension
+    # is dormant in S06 (no CREATE EXTENSION vector) and only activates in S07.
+    DATABASE_URL: str = (
+        "postgresql+psycopg://estimator:estimator@localhost:5433/estimator"
+    )
+    # Where the YAML catalog lives. Resolved relative to the working directory.
+    CATALOG_PATH: Path = Path("data/catalog/catalog.yaml")
+    # Root where ``CatalogSource.location`` entries are resolved against.
+    INGESTION_DATA_ROOT: Path = Path("data/seed")
+    # Output folder for the cleaned, normalized budget JSON files.
+    PROCESSED_DATA_DIR: Path = Path("data/processed")
+    # spaCy model loaded by the Presidio AnalyzerEngine (Spanish).
+    PRESIDIO_SPACY_MODEL: str = "es_core_news_md"
+    # Locale used by Faker to generate consistent pseudonyms per entity_type.
+    PSEUDONYM_FAKER_LOCALE: str = "es_ES"
+    # HMAC salt. Stored in env so it can be rotated independently of the code.
+    PSEUDONYM_HASH_SALT: str = "change-me-in-prod"
 
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":

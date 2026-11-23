@@ -40,6 +40,11 @@ COPY --from=builder /app/.venv /app/.venv
 
 # Copy application source code.
 COPY app/ /app/app/
+# Session 6 — migrations, scripts and seed data/catalog.
+COPY alembic/ /app/alembic/
+COPY alembic.ini /app/alembic.ini
+COPY scripts/ /app/scripts/
+COPY data/ /app/data/
 
 # Ensure the non-root user owns everything it needs to run.
 RUN chown -R appuser:appgroup /app

@@ -276,3 +276,62 @@ Pipeline de cada turno (`EstimationService.estimate_conversational`):
 Coste por turno: el camino normal hace 2 llamadas (estimación + extractor) y 1 más cuando hay que resumir; ACB hace hasta `2 × BOSS_MAX_ITERATIONS` + 1 (+1 resumen).
 
 En Streamlit, la pestaña **Conversation** tiene un selector **Audience tier** (Auto = lo decide el servicio) y un interruptor **Review with Actor-Critic-Boss**; bajo cada respuesta se ve el tier y, con ACB, el rastro de auditoría. El panel lateral muestra anclas, resumen acumulativo y el último tier con la regla que lo decidió.
+
+## Sesión 6 — Datos: catálogo, limpieza, PII y exportación
+
+Objetivo de cierre: **presupuestos históricos limpios, normalizados y guardados en JSON estructurado** en `data/processed/`.
+
+```bash
+uv run python scripts/export_clean_budgets.py                         # sin seudonimizar
+uv run python scripts/export_clean_budgets.py --pseudonymize memory   # Presidio + Faker, mapeo en memoria
+uv run python scripts/export_clean_budgets.py --pseudonymize postgres # mapeo persistente (necesita Postgres)
+uv run python scripts/preflight_s06.py                                # comprobación del entorno
+```
+
+Pipeline: catálogo YAML (solo fuentes `include`) → `FileSystemLoader` → `clean_budget_records` → `validate_with_policy` (Pandera) → seudonimización opcional → contrato Pydantic `CleanBudget` → JSON.
+
+| Fichero de salida | Contenido |
+|---|---|
+| `budgets_clean.json` | Presupuestos válidos (`schema_version`, `count`, `budgets[]`) |
+| `budgets_quarantine.json` | Recuperables tras revisión, con `reasons` |
+| `budgets_discarded.json` | Estructuralmente inválidos, con `reasons` |
+| `cleaning_report.json` | Recuentos, fallos por check, duplicados, linaje |
+
+Con el corpus semilla: 6 ficheros → 1 duplicado colapsado (BUDGET-2024-0005, gana `signed_at` más reciente) → 4 válidos y 1 descartado (`total_amount: -50000`).
+
+### Piezas
+
+- `app/ingestion/catalog/` + `data/catalog/catalog.yaml`: catálogo validado con Pydantic (`include` / `review` / `exclude` con `decision_reason`). CLIs: `python -m app.ingestion.catalog.inspect data/seed` y `python -m app.ingestion.catalog.loader data/catalog/catalog.yaml`.
+- `app/ingestion/architecture.py`: decisión CAG / RAG / híbrido (`python -m app.ingestion.architecture` → RAG para el Proyecto 2).
+- `app/ingestion/parsers/`: `BudgetJsonParser` (markdown estructurado) y `TranscriptTxtParser` (con tags o legacy).
+- `app/ingestion/cleaning/`:
+  - `budget_records.py`: nulos disfrazados → `NA`, moneda en mayúsculas, fechas **parseadas valor a valor** (ISO y `dd/mm/yyyy`), importes a `float`, fases normalizadas, emails en minúsculas, dedup por hash + regla "último `signed_at`".
+  - `schemas.py`: esquema Pandera v2 `strict=True` con todas las columnas declaradas y el check `phases_sum_matches_total`.
+  - `policy.py`: válido / cuarentena / descartado, con motivo por fila. Un fallo a nivel de esquema manda todo el lote a cuarentena.
+  - `export.py`: contrato `CleanBudget` y escritura de los cuatro JSON.
+- `app/ingestion/pii/`: Presidio con `es_core_news_md`, reconocedores `BUDGET_ID` y `CLIENT_CODE`, seudonimizador HMAC consistente.
+  - En la exportación, `contact` y `contact_email` se sustituyen **enteros** (`pseudonymize_value`, sin NER): ya sabemos que todo el campo es PII.
+  - En `notes` solo se buscan emails con Presidio, más una sustitución literal de los nombres conocidos del propio registro. No se usa la detección de personas en texto libre, porque spaCy da falsos positivos que corrompen el texto ("Carga inversa…" → "Carga" detectada como persona).
+  - Orden: primero el escaneo sobre el texto original y después la sustitución literal. Al revés, el escaneo volvería a seudonimizar los emails ya seudonimizados.
+- `app/persistence/` + `alembic/`: tablas `pseudonym_mappings` e `ingestion_jobs` (Postgres `estimator-postgres`, puerto 5433 en el host).
+- API: `POST /api/v1/ingestion/runs` (202) y `GET /api/v1/ingestion/jobs/{job_id}`.
+
+### Diferencias con la referencia `estimator`
+
+- Fechas mezcladas: allí `pd.to_datetime` vectorizado convertía `12/03/2024` en `NaT` y mandaba BUDGET-2024-0002 a cuarentena.
+- El esquema no declaraba `phases`, `contact`, `notes`… y el informe salía con `column_in_schema` y `dtype('float64')` como ruido.
+- El check de suma de fases se anunciaba pero no existía.
+- No había exportación a JSON; aquí es el entregable.
+- El modelo spaCy se instala como dependencia del `pyproject.toml` (funciona también en Docker); se elimina `unstructured`, que no usaba ningún código.
+
+### Variables de entorno nuevas
+
+| Variable | Default |
+|---|---|
+| `DATABASE_URL` | `postgresql+psycopg://estimator:estimator@localhost:5433/estimator` |
+| `CATALOG_PATH` | `data/catalog/catalog.yaml` |
+| `INGESTION_DATA_ROOT` | `data/seed` |
+| `PROCESSED_DATA_DIR` | `data/processed` |
+| `PRESIDIO_SPACY_MODEL` | `es_core_news_md` |
+| `PSEUDONYM_FAKER_LOCALE` | `es_ES` |
+| `PSEUDONYM_HASH_SALT` | `change-me-in-prod` |
