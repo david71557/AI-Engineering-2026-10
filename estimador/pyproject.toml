@@ -34,6 +34,11 @@ dependencies = [
     "spacy>=3.8,<3.9",
     "es-core-news-md @ https://github.com/explosion/spacy-models/releases/download/es_core_news_md-3.8.0/es_core_news_md-3.8.0-py3-none-any.whl",
     "faker>=24.0",
+    # Session 7 — embedding pipeline. openai is already declared above
+    # (>=3.35.1, stricter than the >=1.0.0 the module needs). tiktoken was
+    # only present transitively via litellm; declared explicitly now.
+    # No numpy / scikit-learn for this module: cosine is computed with stdlib.
+    "tiktoken>=0.7.0",
 ]
 
 [dependency-groups]
