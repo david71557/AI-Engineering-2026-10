@@ -335,3 +335,79 @@ Con el corpus semilla: 6 ficheros → 1 duplicado colapsado (BUDGET-2024-0005, g
 | `PRESIDIO_SPACY_MODEL` | `es_core_news_md` |
 | `PSEUDONYM_FAKER_LOCALE` | `es_ES` |
 | `PSEUDONYM_HASH_SALT` | `change-me-in-prod` |
+## Sesión 7 — Pipeline de embeddings
+
+Primer paso hacia la búsqueda semántica: convertir presupuestos históricos (JSON) en vectores. El módulo nuevo vive en `app/embedding_pipeline/` y expone un único endpoint. **No se persiste nada todavía**: los vectores se generan en memoria y se devuelven por HTTP; la persistencia en pgvector entra en la Sesión 08.
+
+Piezas:
+
+- `schemas.py`: modelos Pydantic v2 (`Budget`, `BudgetComponent`, `Chunk`, `EmbeddedChunk`, `IngestRequest`, `IngestResponse`) con validadores explícitos (sector y complejidad como `Literal`, patrones de ids, horas de componentes = total, dependencias dentro del mismo presupuesto).
+- `chunker.py` (`JSONStructuralChunker`): chunking **estructural**, un componente del presupuesto = un chunk. A cada chunk se le antepone una cabecera de contexto del presupuesto padre (proyecto, sector, año, tecnología) para que no pierda la pista de a quién pertenece. Cuenta tokens con `tiktoken`.
+- `embedder.py` (`OpenAIEmbedder`): invoca `text-embedding-3-small` (1536 dims) en **batches** de 100, con reintento exponencial (1s/2s/4s) ante `RateLimitError` y logging por batch.
+- `router.py`: orquesta `chunk → embed → stats`.
+
+### Endpoint nuevo
+
+```
+POST /embeddings/ingest
+  Input  (IngestRequest):  {"budgets": [ <Budget>, ... ]}
+  Output (IngestResponse): {"chunks": [ <EmbeddedChunk>, ... ], "stats": {...}}
+  200 OK · 422 validación Pydantic · 500 error de la API de embeddings (mensaje genérico, detalle en logs)
+```
+
+Aparece en Swagger (`http://localhost:8000/docs`). `data/budgets_sample.json` es un array y el endpoint espera `{"budgets": [...]}`. Para pegarlo en "Try it out", copia el cuerpo ya envuelto al portapapeles (PowerShell, desde `estimador/`) y pégalo sustituyendo el ejemplo:
+
+```powershell
+('{"budgets": ' + (Get-Content data\budgets_sample.json -Raw -Encoding utf8) + '}') | Set-Clipboard
+```
+
+Desde línea de comandos:
+
+```bash
+# httpie (envuelve el array en el campo "budgets")
+http POST :8000/embeddings/ingest budgets:=@data/budgets_sample.json
+
+# curl equivalente (bash)
+curl -s -X POST http://localhost:8000/embeddings/ingest \
+  -H 'Content-Type: application/json' \
+  -d "{\"budgets\": $(cat data/budgets_sample.json)}" | python -m json.tool | head -40
+```
+
+Con el sample: 15 presupuestos → 52 chunks → ~4.1k tokens → coste estimado ~$0.00008.
+
+### Script CLI `compare.py`
+
+Sanity check de los embeddings: embebe dos textos y devuelve su similitud coseno, calculada a mano con la biblioteca estándar (`math`), sin numpy ni scikit-learn. Reutiliza `OpenAIEmbedder`.
+
+**Fuera del contenedor** (desde `estimador/`, con el `.env` cargado; `get_settings()` lee `OPENAI_API_KEY` del `.env`):
+
+```bash
+uv run python scripts/compare.py \
+  --text-a "OAuth 2.0 authentication backend for fintech" \
+  --text-b "JWT-based authorization service for banking app"
+```
+
+**Dentro del contenedor** (`scripts/` está bind-montado en `docker-compose.yml`; el servicio se llama `estimator`, no `estimador`):
+
+```bash
+docker compose exec estimator python scripts/compare.py \
+  --text-a "OAuth 2.0 authentication backend for fintech" \
+  --text-b "JWT-based authorization service for banking app"
+```
+
+Salida:
+
+```
+Text A: OAuth 2.0 authentication backend for fintech
+Text B: JWT-based authorization service for banking app
+Cosine similarity: 0.6329
+```
+
+En PowerShell, sustituye `\` por un backtick (`` ` ``) al final de cada línea, o escribe el comando en una sola línea.
+
+Los resultados de las tres parejas de validación del enunciado (A cercana 0.5957, B no relacionada 0.1920, C genérica 0.5407) y su comentario están en [`app/embedding_pipeline/SANITY_CHECK.md`](app/embedding_pipeline/SANITY_CHECK.md).
+
+### Dependencias y scope
+
+- Nueva dependencia: `tiktoken>=0.7.0` (antes solo llegaba de forma transitiva vía `litellm`). `openai` ya estaba (`>=3.35.1`). No se añade numpy ni scikit-learn para este módulo; la coseno es stdlib. (`numpy` sigue en el proyecto desde la Sesión 04 por la caché semántica.)
+- **Fuera de scope** (lo veremos en directo): otras estrategias de chunking (recursive, semantic, hierarchical, late, contextual retrieval), comparativa de modelos de embeddings, enriquecimiento con LLM, persistencia vectorial y retrieval.
